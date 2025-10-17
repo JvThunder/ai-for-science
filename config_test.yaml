@@ -1,0 +1,51 @@
+# Minimal Test Configuration
+# For quick testing and debugging
+
+data:
+  train_files:
+    - "../Compound_000000001_000025000_props_geom.csv"
+  val_file: "../Compound_000000001_000025000_props_geom.csv"
+  max_bonds: 5  # Reduced from 7
+  batch_size: 32  # Increased for GPU
+  num_workers: 0
+  chunk_size: 100  # Very small chunks for quick test
+  min_element_count: 5
+
+model:
+  hidden_dim: 16  # Much smaller
+  embedding_dim: 8  # Much smaller
+  vocab_size: null
+  max_bonds: 5  # Match data.max_bonds
+
+training:
+  num_epochs: 1  # Just 1 cycle
+  learning_rate: 0.001
+  weight_decay: 0.001
+  grad_clip: 1.0
+  early_stopping_patience: 2
+  validate_every: 1
+  lr_scheduler: null  # Disabled for quick test
+  max_batches_per_epoch: 100  # Limit to 100 batches for quick test
+  max_val_batches: 50  # Limit validation batches
+
+loss:
+  distance_weight: 1.0
+  geometry_weight: 0.3
+  r_weight: 1.0
+  theta_weight: 0.5
+  phi_weight: 0.5
+
+checkpointing:
+  checkpoint_dir: "checkpoints_test"
+  save_every: 1
+  keep_last_n: 1
+
+logging:
+  log_dir: "logs_test"
+  log_every: 5
+
+hardware:
+  device: "cuda"  # Use GPU
+  mixed_precision: false
+
+random_seed: 42

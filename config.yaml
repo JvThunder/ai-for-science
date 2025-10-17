@@ -1,0 +1,122 @@
+# Configuration for Stereochemistry-Aware 3D Reconstruction GCN
+
+# Data Configuration
+data:
+  # Training files: List of CSV files to cycle through
+  # Each file = 1 epoch, model cycles through all files
+  train_files:
+    - "../Compound_000000001_000025000_props_geom.csv"
+    # - "../Compound_000025001_000050000_props_geom.csv"
+    # Add more files as needed
+
+  # Validation file: Single CSV file for validation
+  val_file: "../Compound_000000001_000025000_props_geom.csv"
+
+  # Maximum number of bonds per atom (for padding)
+  max_bonds: 7
+
+  # Batch size for training
+  batch_size: 32
+
+  # Number of dataloader workers for parallel data loading (0 to disable)
+  # Recommend: 4-8 for multi-core CPUs
+  num_workers: 4
+
+  # Prefetch factor: batches to prefetch per worker
+  prefetch_factor: 2
+
+  # Chunk size for CSV streaming (rows per chunk)
+  chunk_size: 10000
+
+  # RAM cache limit for chunks (MB) - trades RAM for speed
+  # Recommend: 2048-8192 MB depending on available RAM
+  cache_ram_mb: 4096
+
+  # Minimum element occurrences for vocabulary
+  min_element_count: 10
+
+# Model Architecture
+model:
+  # Hidden dimension for GCN layers
+  hidden_dim: 64
+
+  # Element embedding dimension
+  embedding_dim: 32
+
+  # Vocabulary size (set automatically from data)
+  vocab_size: null
+
+  # Maximum bonds (should match data.max_bonds)
+  max_bonds: 7
+
+# Training Configuration
+training:
+  # Number of cycles through all files
+  num_epochs: 50
+
+  # Learning rate
+  learning_rate: 0.0001
+
+  # L2 weight decay for regularization
+  weight_decay: 0.001
+
+  # Gradient clipping max norm
+  grad_clip: 1.0
+
+  # Early stopping patience (epochs without improvement)
+  early_stopping_patience: 5
+
+  # Validate every N epochs
+  validate_every: 1
+
+  # Learning rate scheduler: 'plateau', 'step', 'cosine', or null
+  lr_scheduler: "plateau"
+
+  # LR scheduler parameters
+  lr_scheduler_params:
+    factor: 0.7      # Reduce LR by this factor
+    patience: 2      # Epochs without improvement before reducing LR
+    mode: "min"      # Optimize for minimum loss
+
+# Loss Function Weights
+loss:
+  # Weight for distance prediction loss
+  distance_weight: 1.0
+
+  # Weight for geometry (r, θ, φ) prediction loss
+  geometry_weight: 0.3
+
+  # Individual geometry component weights
+  r_weight: 1.0         # Distance to neighbors
+  theta_weight: 0.5     # Polar angle
+  phi_weight: 0.5       # Azimuthal angle
+
+# Checkpointing
+checkpointing:
+  # Directory to save checkpoints
+  checkpoint_dir: "checkpoints"
+
+  # Save checkpoint every N epochs
+  save_every: 1
+
+  # Keep only N most recent checkpoints
+  keep_last_n: 3
+
+# Logging
+logging:
+  # Directory for logs and plots
+  log_dir: "logs"
+
+  # Log metrics every N batches during training
+  log_every: 10
+
+# Hardware
+hardware:
+  # Device: 'cuda', 'cpu', or 'auto' (auto-detect)
+  device: "auto"
+
+  # Enable mixed precision training (if supported)
+  mixed_precision: false
+
+# Reproducibility
+random_seed: 42

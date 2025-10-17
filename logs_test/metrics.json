@@ -1,0 +1,44 @@
+{
+  "epochs": [
+    1
+  ],
+  "train_losses": [
+    0.6218051454424858
+  ],
+  "val_losses": [
+    0.3669925194978714
+  ],
+  "learning_rates": [
+    0.001
+  ],
+  "train_distance_losses": [
+    0.27182041481137276
+  ],
+  "train_geometry_losses": [
+    1.1666157281398772
+  ],
+  "val_distance_losses": [
+    0.10926425054669381
+  ],
+  "val_geometry_losses": [
+    0.8590941894054412
+  ],
+  "distance_maes": [],
+  "distance_rmses": [],
+  "theta_maes": [],
+  "phi_maes": [],
+  "custom_metrics": {
+    "train_distance_loss": [
+      0.27182041481137276
+    ],
+    "train_geometry_loss": [
+      1.1666157281398772
+    ],
+    "val_distance_loss": [
+      0.10926425054669381
+    ],
+    "val_geometry_loss": [
+      0.8590941894054412
+    ]
+  }
+}
