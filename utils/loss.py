@@ -285,14 +285,15 @@ def total_loss(
         reduction='mean'
     )
 
-    # Combined geometry loss
+    # Combined geometry loss (average of A and B)
     loss_geometry = (loss_geom_a + loss_geom_b) / 2
 
-    # Total weighted loss
+    # Total weighted loss - AVERAGE (not sum) distance and geometry components
+    num_components = config['loss']['distance_weight'] + config['loss']['geometry_weight']
     total = (
         config['loss']['distance_weight'] * loss_distance +
         config['loss']['geometry_weight'] * loss_geometry
-    )
+    ) / num_components  # Average across distance and geometry
 
     return {
         'total': total,
