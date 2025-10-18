@@ -2,14 +2,18 @@
 Loss functions for stereochemistry-aware 3D reconstruction.
 
 This module implements specialized loss functions for training the model:
-- Percentage-based loss for distances, θ, and φ angles (scale invariance)
-- Circular percentage loss for periodic φ angles
+- Percentage-based loss for distances (scale invariance)
+- Angle loss normalized by 360° (so 36° error = 0.1 loss)
+- Circular angle loss for periodic φ angles with wraparound
 - Combined geometry loss with masking for variable bond counts
 - Total weighted loss combining all components
 
 Key Features:
-- Percentage error loss: relative error scales better across different value ranges
-- Circular loss: properly handles φ angle wraparound (0° = 360°) with percentage-based error
+- Distance: Percentage error loss (relative to target value)
+- Angles (θ, φ): Normalized by 360° for consistent [0, 1] range
+  - Example: 36° error → 36/360 = 0.1 loss
+  - Example: 180° error → 180/360 = 0.5 loss
+- Circular loss: properly handles φ angle wraparound (0° = 360°)
 - All angles in degrees (θ ∈ [0, 180], φ ∈ [0, 360])
 - Masking: handles variable number of bonds per atom
 - Equal weighting: distance and geometry losses are weighted equally by default
@@ -68,33 +72,33 @@ def circular_angle_loss(
     target_phi: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     period: float = 360.0,
-    epsilon: float = 1e-3,
     reduction: str = 'mean'
 ) -> torch.Tensor:
     """
-    Compute percentage-based circular loss for periodic angles (handles wraparound).
+    Compute circular loss for periodic angles normalized by full circle (360°).
 
     Azimuthal angle φ is periodic: 0° = 360°.
     This loss properly handles the wraparound by computing the shortest
-    angular distance between predicted and target angles, then normalizes
-    by the target value for percentage-based error. Always averages over valid elements.
+    angular distance, then normalizes by 360° (full circle).
+
+    Example: 36° error = 36/360 = 0.1 loss
 
     Args:
         pred_phi: (batch_size, max_bonds) predicted φ angles [0, 360] degrees
         target_phi: (batch_size, max_bonds) target φ angles [0, 360] degrees
         mask: (batch_size, max_bonds) optional mask (1 = valid, 0 = padding)
         period: Period of the angle (default: 360.0 for degrees)
-        epsilon: Small value to prevent division by zero (default: 1e-3)
         reduction: 'mean' or 'none' (default: 'mean')
 
     Returns:
-        loss: Mean percentage error or per-element loss
+        loss: Mean normalized error [0, 1] or per-element loss
 
     Example:
-        >>> pred = torch.tensor([[5.0, 358.0]])  # 358° is close to 0°
+        >>> pred = torch.tensor([[36.0, 358.0]])
         >>> target = torch.tensor([[0.0, 0.0]])
         >>> loss = circular_angle_loss(pred, target)
-        >>> # Uses shortest path: min(|358-0|, 360-|358-0|) = 2°, then / |target|
+        >>> # 36° error -> 36/360 = 0.1, 2° error -> 2/360 ≈ 0.0056
+        >>> # Mean = (0.1 + 0.0056) / 2 ≈ 0.053
     """
     # Compute angular difference
     diff = pred_phi - target_phi
@@ -103,27 +107,26 @@ def circular_angle_loss(
     # This finds the shortest angular distance
     diff = torch.remainder(diff + period / 2, period) - period / 2
 
-    # Absolute error
+    # Absolute error in degrees
     abs_diff = torch.abs(diff)
 
-    # Percentage-based: normalize by target magnitude
-    abs_target = torch.abs(target_phi) + epsilon
-    percent_error = abs_diff / abs_target
+    # Normalize by full circle (360°) to get [0, 1] range
+    normalized_error = abs_diff / 360.0
 
     # Apply mask if provided
     if mask is not None:
-        percent_error = percent_error * mask
+        normalized_error = normalized_error * mask
         if reduction == 'mean':
             # Mean over valid elements only
             num_valid = torch.sum(mask) + 1e-8  # Avoid division by zero
-            return torch.sum(percent_error) / num_valid
+            return torch.sum(normalized_error) / num_valid
         else:  # 'none'
-            return percent_error
+            return normalized_error
     else:
         if reduction == 'mean':
-            return torch.mean(percent_error)
+            return torch.mean(normalized_error)
         elif reduction == 'none':
-            return percent_error
+            return normalized_error
         else:
             raise ValueError(f"Invalid reduction: {reduction}. Must be 'mean' or 'none'")
 
@@ -148,12 +151,12 @@ def geometry_loss(
         reduction: 'mean' or 'none' (default: 'mean')
 
     Returns:
-        loss: Mean combined geometry loss (percentage-based)
+        loss: Mean combined geometry loss
 
     Note:
         - r: Uses percentage loss (scale-invariant)
-        - θ: Uses percentage loss (bounded [0, 180])
-        - φ: Uses percentage-based circular loss (periodic [0, 360])
+        - θ: Normalized by 360° (so 36° error = 0.1 loss)
+        - φ: Normalized by 360° with circular wraparound (so 36° error = 0.1 loss)
     """
     if weights is None:
         weights = {'r': 1.0, 'theta': 1.0, 'phi': 1.0}
@@ -171,19 +174,21 @@ def geometry_loss(
     loss_r = percentage_loss(pred_r, target_r, epsilon=1e-3, reduction='none')
     loss_r = loss_r * mask  # Apply mask
 
-    # Loss for θ (polar angle) - percentage loss
-    loss_theta = percentage_loss(pred_theta, target_theta, epsilon=1e-3, reduction='none')
-    loss_theta = loss_theta * mask  # Apply mask
+    # Loss for θ (polar angle) - normalized by 360 degrees
+    theta_diff = torch.abs(pred_theta - target_theta)
+    loss_theta = (theta_diff / 360.0) * mask  # Normalize by 360°
 
-    # Loss for φ (azimuthal angle) - percentage-based circular loss
-    loss_phi = circular_angle_loss(pred_phi, target_phi, mask=mask, period=360.0, epsilon=1e-3, reduction='none')
+    # Loss for φ (azimuthal angle) - circular loss normalized by 360°
+    loss_phi = circular_angle_loss(pred_phi, target_phi, mask=mask, period=360.0, reduction='none')
 
-    # Combine with weights
+    # Combine with weights and AVERAGE (not sum) the three components
+    # This ensures the geometry loss stays in a reasonable [0, ~1] range
+    num_components = sum(weights.values())  # Typically 3.0 if all weights are 1.0
     total_loss = (
         weights['r'] * loss_r +
         weights['theta'] * loss_theta +
         weights['phi'] * loss_phi
-    )
+    ) / num_components  # Average across components
 
     # Average over valid elements
     if reduction == 'mean':
