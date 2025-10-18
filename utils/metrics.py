@@ -6,6 +6,7 @@ Provides MetricsLogger class for tracking and visualizing training metrics:
 - Learning rate schedule
 - Distance and angle accuracy metrics
 - Customizable plots
+- Weights & Biases (wandb) integration
 
 Also includes utilities for generating training reports.
 """
@@ -16,6 +17,14 @@ from typing import Dict, List, Optional
 import json
 import os
 from pathlib import Path
+
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 
 class MetricsLogger:
@@ -35,15 +44,22 @@ class MetricsLogger:
     - summary(): Print training summary
     """
 
-    def __init__(self, log_dir: str = "logs"):
+    def __init__(self, log_dir: str = "logs", use_wandb: bool = False):
         """
         Initialize metrics logger.
 
         Args:
             log_dir: Directory to save logs and plots
+            use_wandb: Enable Weights & Biases logging
         """
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
+
+        # Wandb setup
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        if use_wandb and not WANDB_AVAILABLE:
+            print("Warning: wandb requested but not installed. Install with: pip install wandb")
+            print("Continuing without wandb logging...")
 
         # Metrics storage
         self.epochs = []
@@ -119,6 +135,40 @@ class MetricsLogger:
                 if key not in self.custom_metrics:
                     self.custom_metrics[key] = []
                 self.custom_metrics[key].append(value)
+
+        # Log to wandb if enabled
+        if self.use_wandb:
+            wandb_dict = {
+                'epoch': epoch,
+                'train/loss': train_loss,
+                'train/learning_rate': lr
+            }
+
+            if val_loss is not None:
+                wandb_dict['val/loss'] = val_loss
+
+            if metrics:
+                # Component losses
+                if 'train_distance_loss' in metrics:
+                    wandb_dict['train/distance_loss'] = metrics['train_distance_loss']
+                if 'train_geometry_loss' in metrics:
+                    wandb_dict['train/geometry_loss'] = metrics['train_geometry_loss']
+                if 'val_distance_loss' in metrics and metrics['val_distance_loss'] is not None:
+                    wandb_dict['val/distance_loss'] = metrics['val_distance_loss']
+                if 'val_geometry_loss' in metrics and metrics['val_geometry_loss'] is not None:
+                    wandb_dict['val/geometry_loss'] = metrics['val_geometry_loss']
+
+                # Angle metrics
+                if 'distance_mae' in metrics:
+                    wandb_dict['metrics/distance_mae'] = metrics['distance_mae']
+                if 'distance_rmse' in metrics:
+                    wandb_dict['metrics/distance_rmse'] = metrics['distance_rmse']
+                if 'theta_mae' in metrics:
+                    wandb_dict['metrics/theta_mae'] = metrics['theta_mae']
+                if 'phi_mae' in metrics:
+                    wandb_dict['metrics/phi_mae'] = metrics['phi_mae']
+
+            wandb.log(wandb_dict, step=epoch)
 
     def save(self, filename: str = "metrics.json"):
         """
@@ -297,6 +347,14 @@ class MetricsLogger:
                 print(f"Final Phi MAE: {self.phi_maes[-1]:.2f}°")
 
         print("="*60 + "\n")
+
+    def finish(self):
+        """
+        Finish logging session (closes wandb if enabled).
+        """
+        if self.use_wandb:
+            wandb.finish()
+            print("Wandb run finished")
 
 
 def plot_prediction_comparison(

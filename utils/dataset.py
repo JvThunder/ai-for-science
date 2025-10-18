@@ -253,7 +253,10 @@ class MultiFileStreamingDataset(Dataset):
         include_non_bonded: bool = False,
         training: bool = True,
         max_samples: Optional[int] = None,
-        cache_ram_mb: int = 4096
+        cache_ram_mb: int = 4096,
+        val_split_ratio: float = 0.0,
+        split: Optional[str] = None,
+        split_seed: int = 42
     ):
         """
         Initialize multi-file streaming dataset.
@@ -270,6 +273,9 @@ class MultiFileStreamingDataset(Dataset):
             training: If True, apply random rotation augmentation
             max_samples: Maximum number of samples (bonds) to use (for testing)
             cache_ram_mb: Maximum RAM for caching chunks (MB, default: 4GB)
+            val_split_ratio: Fraction of data to use for validation (0.0-1.0)
+            split: Which split to use - 'train', 'val', or None (use all data)
+            split_seed: Random seed for train/val splitting (for reproducibility)
         """
         super().__init__()
 
@@ -293,6 +299,9 @@ class MultiFileStreamingDataset(Dataset):
         self.include_non_bonded = include_non_bonded
         self.training = training
         self.max_samples = max_samples
+        self.val_split_ratio = val_split_ratio
+        self.split = split
+        self.split_seed = split_seed
 
         # Index mapping (lightweight - only counts, not data)
         self.valid_molecule_indices = []  # (chunk_idx, row_in_chunk, bond_count)
@@ -314,12 +323,10 @@ class MultiFileStreamingDataset(Dataset):
         """
         print(f"\nLoading metadata from: {self.current_file}")
 
-        self.valid_molecule_indices = []
-        self.total_bonds = 0
-
+        all_molecule_indices = []
         chunk_idx = 0
 
-        # Read CSV in chunks
+        # Read CSV in chunks and collect all molecule indices
         for chunk in pd.read_csv(self.current_file, chunksize=self.chunk_size):
             for row_in_chunk, (_, row) in enumerate(chunk.iterrows()):
                 try:
@@ -352,19 +359,67 @@ class MultiFileStreamingDataset(Dataset):
                         bond_count += bond_count // 3
 
                     if bond_count > 0:
-                        self.valid_molecule_indices.append((chunk_idx, row_in_chunk, bond_count))
-                        self.total_bonds += bond_count
-
-                        # Check sample limit
-                        if self.max_samples and self.total_bonds >= self.max_samples:
-                            return
+                        all_molecule_indices.append((chunk_idx, row_in_chunk, bond_count))
 
                 except Exception:
                     continue
 
             chunk_idx += 1
 
-        print(f"Metadata loaded: {len(self.valid_molecule_indices)} molecules, {self.total_bonds} bonds")
+        # Apply train/val split if requested
+        if self.val_split_ratio > 0.0 and self.split is not None:
+            self.valid_molecule_indices = self._apply_train_val_split(all_molecule_indices)
+        else:
+            self.valid_molecule_indices = all_molecule_indices
+
+        # Calculate total bonds
+        self.total_bonds = sum(bond_count for _, _, bond_count in self.valid_molecule_indices)
+
+        # Apply max_samples limit if specified
+        if self.max_samples and self.total_bonds > self.max_samples:
+            total = 0
+            for idx, (chunk_idx, row_in_chunk, bond_count) in enumerate(self.valid_molecule_indices):
+                total += bond_count
+                if total >= self.max_samples:
+                    self.valid_molecule_indices = self.valid_molecule_indices[:idx+1]
+                    self.total_bonds = self.max_samples
+                    break
+
+        split_info = f" ({self.split} split)" if self.split else ""
+        print(f"Metadata loaded{split_info}: {len(self.valid_molecule_indices)} molecules, {self.total_bonds} bonds")
+
+    def _apply_train_val_split(self, all_molecule_indices: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+        """
+        Apply train/val split to molecule indices.
+
+        Args:
+            all_molecule_indices: List of (chunk_idx, row_in_chunk, bond_count) tuples
+
+        Returns:
+            Filtered list of molecule indices for the specified split
+        """
+        if not all_molecule_indices:
+            return []
+
+        # Use a deterministic random seed for reproducible splits
+        rng = random.Random(self.split_seed + hash(self.current_file))
+
+        # Shuffle indices with the deterministic seed
+        shuffled_indices = list(all_molecule_indices)
+        rng.shuffle(shuffled_indices)
+
+        # Calculate split point
+        n_total = len(shuffled_indices)
+        n_val = int(n_total * self.val_split_ratio)
+        n_train = n_total - n_val
+
+        # Return appropriate split
+        if self.split == 'train':
+            return shuffled_indices[:n_train]
+        elif self.split == 'val':
+            return shuffled_indices[n_train:]
+        else:
+            return all_molecule_indices
 
     def next_file(self) -> str:
         """

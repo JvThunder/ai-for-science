@@ -10,7 +10,7 @@ Provides functions for:
 Example config.yaml structure:
     data:
       train_files: ["file1.csv", "file2.csv"]
-      val_file: "val.csv"
+      val_split_ratio: 0.1
       max_bonds: 7
       batch_size: 32
 
@@ -89,7 +89,7 @@ def get_default_config() -> Dict[str, Any]:
     config = {
         'data': {
             'train_files': ['../Compound_000000001_000025000_props_geom.csv'],
-            'val_file': '../Compound_000000001_000025000_props_geom.csv',
+            'val_split_ratio': 0.1,  # Fraction of each file for validation
             'max_bonds': 7,
             'batch_size': 32,
             'num_workers': 4,  # Parallel data loading (set to 0 to disable)
@@ -187,16 +187,15 @@ def validate_config(config: Dict[str, Any]) -> bool:
     if 'train_files' not in data_config or len(data_config['train_files']) == 0:
         raise ValueError("data.train_files must be specified and non-empty")
 
-    if 'val_file' not in data_config:
-        raise ValueError("data.val_file must be specified")
-
     # Check that files exist
     for train_file in data_config['train_files']:
         if not os.path.exists(train_file):
             raise ValueError(f"Training file not found: {train_file}")
 
-    if not os.path.exists(data_config['val_file']):
-        raise ValueError(f"Validation file not found: {data_config['val_file']}")
+    # Validate val_split_ratio if specified
+    val_split_ratio = data_config.get('val_split_ratio', 0.1)
+    if val_split_ratio < 0.0 or val_split_ratio >= 1.0:
+        raise ValueError("val_split_ratio must be in range [0.0, 1.0)")
 
     # Validate numeric ranges
     if config['data']['batch_size'] <= 0:

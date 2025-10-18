@@ -5,22 +5,24 @@ data:
   # Training files: List of CSV files to cycle through
   # Each file = 1 epoch, model cycles through all files
   train_files:
-    - "../Compound_000000001_000025000_props_geom.csv"
-    # - "../Compound_000025001_000050000_props_geom.csv"
+    - "./data/Compound_000000001_000025000_props_geom.csv"
+    - "./data/Compound_000025001_000050000_props_geom.csv"
     # Add more files as needed
 
-  # Validation file: Single CSV file for validation
-  val_file: "../Compound_000000001_000025000_props_geom.csv"
+  # Validation split ratio: Fraction of each file to use for validation (0.0-1.0)
+  # A random val_split_ratio fraction is held out from each training file for validation
+  # For example, 0.1 means 90% train / 10% val split per file
+  val_split_ratio: 0.1
 
   # Maximum number of bonds per atom (for padding)
   max_bonds: 7
 
   # Batch size for training
-  batch_size: 32
+  batch_size: 1024
 
   # Number of dataloader workers for parallel data loading (0 to disable)
   # Recommend: 4-8 for multi-core CPUs
-  num_workers: 4
+  num_workers: 8
 
   # Prefetch factor: batches to prefetch per worker
   prefetch_factor: 2
@@ -38,10 +40,10 @@ data:
 # Model Architecture
 model:
   # Hidden dimension for GCN layers
-  hidden_dim: 64
+  hidden_dim: 32
 
   # Element embedding dimension
-  embedding_dim: 32
+  embedding_dim: 16
 
   # Vocabulary size (set automatically from data)
   vocab_size: null
@@ -49,10 +51,14 @@ model:
   # Maximum bonds (should match data.max_bonds)
   max_bonds: 7
 
+  # Depth: Number of GCN layers (graph distance from bond being evaluated)
+  # depth=1: 1 GCN layer, depth=2: 2 layers, depth=3: 3 layers, etc.
+  depth: 1
+
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 50
+  num_epochs: 2
 
   # Learning rate
   learning_rate: 0.0001
@@ -84,12 +90,12 @@ loss:
   distance_weight: 1.0
 
   # Weight for geometry (r, θ, φ) prediction loss
-  geometry_weight: 0.3
+  geometry_weight: 1.0
 
-  # Individual geometry component weights
+  # Individual geometry component weights (all percentage-based and equal)
   r_weight: 1.0         # Distance to neighbors
-  theta_weight: 0.5     # Polar angle
-  phi_weight: 0.5       # Azimuthal angle
+  theta_weight: 1.0     # Polar angle (degrees)
+  phi_weight: 1.0       # Azimuthal angle (degrees)
 
 # Checkpointing
 checkpointing:
@@ -100,7 +106,7 @@ checkpointing:
   save_every: 1
 
   # Keep only N most recent checkpoints
-  keep_last_n: 3
+  keep_last_n: 1
 
 # Logging
 logging:
@@ -110,10 +116,18 @@ logging:
   # Log metrics every N batches during training
   log_every: 10
 
+  # Weights & Biases integration
+  use_wandb: true
+  wandb_project: "stereochem-gcn"
+  wandb_entity: null  # Set to your wandb username/team (or leave null for default)
+  wandb_run_name: null  # Auto-generated if null (e.g., "run-2025-01-15-143022")
+  wandb_tags: []  # List of tags for organizing runs (e.g., ["experiment1", "baseline"])
+  wandb_notes: null  # Optional notes about this run
+
 # Hardware
 hardware:
   # Device: 'cuda', 'cpu', or 'auto' (auto-detect)
-  device: "auto"
+  device: "cuda"
 
   # Enable mixed precision training (if supported)
   mixed_precision: false

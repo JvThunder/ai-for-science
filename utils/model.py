@@ -31,16 +31,17 @@ class LocalGeometryGCN(nn.Module):
         max_bonds: Maximum number of bonds per atom (default: 7)
         vocab_size: Size of element vocabulary (enables embeddings)
         embedding_dim: Dimension of element embeddings (default: 32)
+        depth: Number of GCN layers (graph distance to propagate, default: 1)
 
     Architecture:
         1. Element embedding layer (if vocab_size provided)
-        2. GCN encoder: node_encoder → conv1 → conv2
+        2. GCN encoder: configurable depth (number of GCN layers)
         3. Batch normalization and dropout for regularization
         4. Distance head: predicts A-B distance
         5. Geometry head: predicts (r, θ, φ) for each neighbor
            - r: distance (Angstroms) via softplus activation
-           - θ: polar angle [0, π] via sigmoid
-           - φ: azimuthal angle [0, 2π] via sigmoid
+           - θ: polar angle [0, 180] degrees via sigmoid
+           - φ: azimuthal angle [0, 360] degrees via sigmoid
     """
 
     def __init__(
@@ -49,12 +50,14 @@ class LocalGeometryGCN(nn.Module):
         hidden_dim: int = 64,
         max_bonds: int = 7,
         vocab_size: int = None,
-        embedding_dim: int = 32
+        embedding_dim: int = 32,
+        depth: int = 1
     ):
         super().__init__()
         self.max_bonds = max_bonds
         self.use_embeddings = vocab_size is not None
         self.hidden_dim = hidden_dim
+        self.depth = max(1, depth)  # Ensure at least 1 layer
 
         # Element embeddings (preferred over one-hot encoding)
         if self.use_embeddings:
@@ -64,14 +67,18 @@ class LocalGeometryGCN(nn.Module):
             # Fallback to one-hot features if no vocab provided
             encoder_input_dim = num_node_features
 
-        # GCN layers for subgraph encoding
-        self.node_encoder = GCNConv(encoder_input_dim, hidden_dim)
-        self.conv1 = GCNConv(hidden_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        # GCN layers for subgraph encoding (dynamically created based on depth)
+        self.gcn_layers = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
 
-        # Batch normalization (skipped if batch_size == 1)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        # First layer (input -> hidden)
+        self.gcn_layers.append(GCNConv(encoder_input_dim, hidden_dim))
+        self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+
+        # Additional layers (hidden -> hidden)
+        for _ in range(self.depth - 1):
+            self.gcn_layers.append(GCNConv(hidden_dim, hidden_dim))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
         # Dropout for regularization
         self.dropout = nn.Dropout(0.3)
@@ -118,9 +125,9 @@ class LocalGeometryGCN(nn.Module):
 
         Output activations:
             - distance: softplus (positive values)
-            - r: softplus (positive distances)
-            - θ: sigmoid * π (range [0, π])
-            - φ: sigmoid * 2π (range [0, 2π])
+            - r: softplus (positive distances in Angstroms)
+            - θ: sigmoid * 180 (range [0, 180] degrees)
+            - φ: sigmoid * 360 (range [0, 360] degrees)
         """
         x, edge_index = data.x, data.edge_index
         node_a, node_b = data.node_a, data.node_b
@@ -130,19 +137,13 @@ class LocalGeometryGCN(nn.Module):
         if self.use_embeddings:
             x = self.element_embedding(x)
 
-        # GCN encoding with batch normalization and dropout
-        x = F.relu(self.node_encoder(x, edge_index))
-        if x.size(0) > 1:  # Skip batch norm if batch size == 1
-            x = self.bn1(x)
-        x = self.dropout(x)
-
-        x = F.relu(self.conv1(x, edge_index))
-        if x.size(0) > 1:
-            x = self.bn2(x)
-        x = self.dropout(x)
-
-        x = F.relu(self.conv2(x, edge_index))
-        x = self.dropout(x)
+        # GCN encoding with batch normalization and dropout (loop through all layers)
+        for i, (gcn_layer, bn_layer) in enumerate(zip(self.gcn_layers, self.batch_norms)):
+            x = gcn_layer(x, edge_index)
+            x = F.relu(x)
+            if x.size(0) > 1:  # Skip batch norm if batch size == 1
+                x = bn_layer(x)
+            x = self.dropout(x)
 
         # Extract embeddings for target nodes A and B
         # Handle batched vs. single graph indexing
@@ -177,8 +178,8 @@ class LocalGeometryGCN(nn.Module):
 
         # Apply activations for (r, θ, φ)
         r_a = F.softplus(geom_a_raw[:, :, 0:1])  # (batch_size, max_bonds, 1) - positive distances
-        theta_a = torch.sigmoid(geom_a_raw[:, :, 1:2]) * math.pi  # (batch_size, max_bonds, 1) - [0, π]
-        phi_a = torch.sigmoid(geom_a_raw[:, :, 2:3]) * 2 * math.pi  # (batch_size, max_bonds, 1) - [0, 2π]
+        theta_a = torch.sigmoid(geom_a_raw[:, :, 1:2]) * 180.0  # (batch_size, max_bonds, 1) - [0, 180] degrees
+        phi_a = torch.sigmoid(geom_a_raw[:, :, 2:3]) * 360.0  # (batch_size, max_bonds, 1) - [0, 360] degrees
 
         geometry_a = torch.cat([r_a, theta_a, phi_a], dim=-1)  # (batch_size, max_bonds, 3)
 
@@ -188,8 +189,8 @@ class LocalGeometryGCN(nn.Module):
 
         # Apply activations for (r, θ, φ)
         r_b = F.softplus(geom_b_raw[:, :, 0:1])  # (batch_size, max_bonds, 1)
-        theta_b = torch.sigmoid(geom_b_raw[:, :, 1:2]) * math.pi  # (batch_size, max_bonds, 1)
-        phi_b = torch.sigmoid(geom_b_raw[:, :, 2:3]) * 2 * math.pi  # (batch_size, max_bonds, 1)
+        theta_b = torch.sigmoid(geom_b_raw[:, :, 1:2]) * 180.0  # (batch_size, max_bonds, 1) - [0, 180] degrees
+        phi_b = torch.sigmoid(geom_b_raw[:, :, 2:3]) * 360.0  # (batch_size, max_bonds, 1) - [0, 360] degrees
 
         geometry_b = torch.cat([r_b, theta_b, phi_b], dim=-1)  # (batch_size, max_bonds, 3)
 

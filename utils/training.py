@@ -201,11 +201,19 @@ def validate_on_file(
                 data = data.to(device)
                 pred_dist, pred_geom_a, pred_geom_b = model(data)
 
+                # Get batch size and max_bonds for reshaping
+                batch_size = data.num_graphs
+                max_bonds = config['data']['max_bonds']
+
+                # Reshape target_geometry_a from (batch_size * max_bonds, 3) to (batch_size, max_bonds, 3)
+                target_geom_a = data.target_geometry_a.view(batch_size, max_bonds, 3)
+                bond_mask_a = data.bond_mask_a.view(batch_size, max_bonds)
+
                 all_pred_distances.append(pred_dist.cpu())
                 all_target_distances.append(data.target_distance.cpu())
                 all_pred_theta_a.append(pred_geom_a[:, :, 1].cpu())
-                all_target_theta_a.append(data.target_geometry_a[:, :, 1].cpu())
-                all_mask_a.append(data.bond_mask_a.cpu())
+                all_target_theta_a.append(target_geom_a[:, :, 1].cpu())
+                all_mask_a.append(bond_mask_a.cpu())
 
             # Update progress bar
             if num_batches > 0:
@@ -327,19 +335,9 @@ def train_multi_file(
     early_stopping_patience = config['training'].get('early_stopping_patience', 5)
     validate_every = config['training'].get('validate_every', 1)
 
-    # Validation dataloader (single file, reused)
+    # DataLoader parameters
     num_workers = config['data'].get('num_workers', 4)
     prefetch_factor = config['data'].get('prefetch_factor', 2) if num_workers > 0 else None
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['data']['batch_size'],
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        pin_memory=True if device.type == 'cuda' else False,
-        persistent_workers=True if num_workers > 0 else False
-    )
 
     # File cycling
     total_files = len(train_dataset.file_paths)
@@ -358,8 +356,10 @@ def train_multi_file(
             if file_idx > 0:  # Skip first file (already loaded)
                 print(f"\nSwitching to file {file_idx + 1}/{total_files}...")
                 train_dataset.next_file()
+                # Also switch validation dataset to the same file
+                val_dataset.next_file()
 
-            # Create dataloader for current file
+            # Create dataloaders for current file
             # Use multiprocessing for faster data loading
             train_loader = DataLoader(
                 train_dataset,
@@ -371,8 +371,19 @@ def train_multi_file(
                 persistent_workers=True if num_workers > 0 else False
             )
 
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=config['data']['batch_size'],
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                pin_memory=True if device.type == 'cuda' else False,
+                persistent_workers=True if num_workers > 0 else False
+            )
+
             print(f"\nEpoch {global_epoch} - Training on file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
-            print(f"Dataset size: {len(train_dataset)} bonds")
+            print(f"Train dataset size: {len(train_dataset)} bonds")
+            print(f"Val dataset size: {len(val_dataset)} bonds")
 
             # Train one epoch
             start_time = time.time()

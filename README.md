@@ -58,13 +58,16 @@ pip install torch-geometric
 
 # Other dependencies
 pip install pandas numpy matplotlib pyyaml tqdm scikit-learn
+
+# Optional: Weights & Biases for experiment tracking
+pip install wandb
 ```
 
 ### 2. Data Preparation
 
-Place your CSV files in the parent directory:
+Place your CSV files in th directory:
 ```
-AI-for-Science/
+./data/
  Compound_000000001_000025000_props_geom.csv
  Compound_000025001_000050000_props_geom.csv
  ...
@@ -81,9 +84,9 @@ Edit `config.yaml` to set your data paths and hyperparameters:
 ```yaml
 data:
   train_files:
-    - "../Compound_000000001_000025000_props_geom.csv"
-    - "../Compound_000025001_000050000_props_geom.csv"
-  val_file: "../Compound_000000001_000025000_props_geom.csv"
+    - "./data/Compound_000000001_000025000_props_geom.csv"
+    - "./data/Compound_000025001_000050000_props_geom.csv"
+  val_split_ratio: 0.1  # 10% of each file used for validation
   batch_size: 32
 
 model:
@@ -100,7 +103,6 @@ training:
 Start training with:
 
 ```bash
-cd new_implementation
 python local_geometry_gcn_stereo.py --config config.yaml
 ```
 
@@ -121,6 +123,153 @@ Training progress is logged to:
 - **logs/metrics.json**: JSON file with all metrics
 - **logs/training_metrics.png**: Visualization plots
 - **checkpoints/**: Model checkpoints (saved after each epoch)
+- **Weights & Biases**: Online experiment tracking (optional, see below)
+
+##  Weights & Biases Integration
+
+This project includes built-in support for [Weights & Biases (wandb)](https://wandb.ai), a powerful experiment tracking and visualization platform.
+
+### Installation
+
+```bash
+pip install wandb
+```
+
+### Setup
+
+1. **Create a free wandb account** at [wandb.ai/signup](https://wandb.ai/signup)
+
+2. **Login to wandb** (only needed once):
+```bash
+wandb login
+```
+You'll be prompted to enter your API key (found at [wandb.ai/authorize](https://wandb.ai/authorize))
+
+3. **Enable wandb in config.yaml** (enabled by default):
+```yaml
+logging:
+  use_wandb: true
+  wandb_project: "stereochem-gcn"
+  wandb_entity: null  # Your username or team (optional)
+  wandb_run_name: null  # Auto-generated if null
+  wandb_tags: ["baseline", "experiment1"]  # Optional tags
+  wandb_notes: "Testing new loss weights"  # Optional notes
+```
+
+### What Gets Logged
+
+Wandb automatically tracks:
+- **Loss curves**: Train/val total loss, distance loss, geometry loss
+- **Metrics**: Distance MAE/RMSE, angle errors (θ, φ)
+- **Hyperparameters**: Learning rate, batch size, model architecture
+- **Learning rate schedule**: Track LR changes over time
+- **System metrics**: GPU/CPU usage, memory consumption
+
+### Usage
+
+**Option 1: Use config file (default)**
+```bash
+python local_geometry_gcn_stereo.py --config config.yaml
+# Wandb enabled by default, view at the URL printed in console
+```
+
+**Option 2: Disable wandb temporarily**
+```yaml
+# In config.yaml
+logging:
+  use_wandb: false
+```
+
+**Option 3: Custom project/run names**
+```yaml
+logging:
+  use_wandb: true
+  wandb_project: "my-molecule-project"
+  wandb_entity: "my-team"  # Your wandb username or team
+  wandb_run_name: "lr-sweep-001"
+  wandb_tags: ["sweep", "lr-optimization"]
+```
+
+### Viewing Results
+
+After training starts, you'll see:
+```
+WandB initialized: run-2025-01-15-143022
+View at: https://wandb.ai/username/stereochem-gcn/runs/abc123
+```
+
+Visit that URL to see:
+- **Real-time metrics**: Loss curves update during training
+- **Interactive plots**: Compare multiple runs
+- **System metrics**: GPU/CPU/memory usage
+- **Model artifacts**: Download checkpoints
+- **Notes & tags**: Organize experiments
+
+### Advanced Features
+
+**Compare Multiple Runs:**
+```bash
+# Run 1: Baseline
+python local_geometry_gcn_stereo.py --config config.yaml --lr 0.0001
+
+# Run 2: Higher LR
+python local_geometry_gcn_stereo.py --config config.yaml --lr 0.001
+
+# View both runs in wandb dashboard and compare
+```
+
+**Sweeps (Hyperparameter Optimization):**
+
+Create a sweep config file `sweep.yaml`:
+```yaml
+program: local_geometry_gcn_stereo.py
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+parameters:
+  learning_rate:
+    min: 0.00001
+    max: 0.001
+  batch_size:
+    values: [16, 32, 64]
+  hidden_dim:
+    values: [32, 64, 128]
+```
+
+Run sweep:
+```bash
+wandb sweep sweep.yaml  # Creates sweep ID
+wandb agent USERNAME/PROJECT/SWEEP_ID  # Starts agents
+```
+
+**Offline Mode** (no internet):
+```bash
+export WANDB_MODE=offline
+python local_geometry_gcn_stereo.py --config config.yaml
+# Logs saved locally, sync later with: wandb sync
+```
+
+### Troubleshooting
+
+**"wandb not installed" warning:**
+```bash
+pip install wandb
+```
+
+**Authentication issues:**
+```bash
+wandb login --relogin
+```
+
+**Disable wandb for debugging:**
+```yaml
+logging:
+  use_wandb: false
+```
+
+**View past runs:**
+Visit [wandb.ai/USERNAME/stereochem-gcn](https://wandb.ai) (replace USERNAME with your wandb username)
 
 ##  Model Architecture
 
@@ -155,7 +304,7 @@ Geometry Head: Individual embeddings → max_bonds * 3 (r, θ, φ per neighbor)
 ### Cylindrical Coordinates (r, θ, φ)
 
 Instead of predicting absolute 3D positions, we predict geometry in a **bond-centered coordinate system**:
-
+   
 1. **Bond Axis**: A→B bond defines the local z-axis
 2. **Orthonormal Frame**: Gram-Schmidt constructs perpendicular x and y axes
 3. **Neighbor Coordinates**: Each neighbor's position expressed as:
@@ -168,15 +317,22 @@ Instead of predicting absolute 3D positions, we predict geometry in a **bond-cen
 - Stereochemistry-aware: φ ordering captures chirality and stereoisomers
 - Physically meaningful: Directly interpretable distances and angles
 
-### File-Based Epochs
+### File-Based Epochs with Per-Epoch Validation
 
 For TB-scale data that doesn't fit in RAM:
 - Each CSV file = 1 epoch
 - Dataset streams from disk with chunked reading (10k rows/chunk)
 - After each epoch, cycle to next file
 - NO persistent caching - pure streaming
+- **Validation split**: Each file is randomly split (e.g., 90% train / 10% val)
+  - The split is deterministic (same molecules in train/val each time you run)
+  - Different files get different random splits for diversity
 
 Example: 100 files × 25k molecules/file = 100 epochs through 2.5M molecules
+- Epoch 1: File 1 (90% train, 10% val)
+- Epoch 2: File 2 (90% train, 10% val)
+- Epoch 3: File 3 (90% train, 10% val)
+- ...
 
 ### Loss Functions
 
@@ -226,10 +382,11 @@ python tests/test_dataset_quick.py # Dataset streaming
 
 ### Data
 - `train_files`: List of training CSV files
-- `val_file`: Validation CSV file
+- `val_split_ratio`: Fraction of each file for validation, randomly sampled (default: 0.1)
 - `batch_size`: Training batch size (default: 32)
 - `max_bonds`: Maximum bonds per atom (default: 7)
 - `chunk_size`: CSV chunk size for streaming (default: 10000)
+- `cache_ram_mb`: RAM limit for chunk caching (default: 4096)
 
 ### Model
 - `hidden_dim`: GCN hidden dimension (default: 64)
@@ -248,6 +405,16 @@ python tests/test_dataset_quick.py # Dataset streaming
 - `distance_weight`: Weight for A-B distance loss (default: 1.0)
 - `geometry_weight`: Weight for (r, θ, φ) loss (default: 0.3)
 - `r_weight`, `theta_weight`, `phi_weight`: Individual geometry weights
+
+### Logging
+- `log_dir`: Directory for logs and plots (default: "logs")
+- `log_every`: Log metrics every N batches (default: 10)
+- `use_wandb`: Enable Weights & Biases tracking (default: true)
+- `wandb_project`: WandB project name (default: "stereochem-gcn")
+- `wandb_entity`: WandB username or team (optional)
+- `wandb_run_name`: Custom run name (auto-generated if null)
+- `wandb_tags`: List of tags for organizing runs
+- `wandb_notes`: Optional notes about the run
 
 ##  Advanced Usage
 

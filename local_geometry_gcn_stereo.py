@@ -35,6 +35,15 @@ import os
 import random
 import numpy as np
 from pathlib import Path
+from datetime import datetime
+
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 
 # Import utilities
 from utils.config import load_config, validate_config, print_config, merge_configs
@@ -119,7 +128,10 @@ def create_datasets(config):
     # Update config with vocab size
     config['model']['vocab_size'] = vocab_size
 
-    # Create training dataset
+    # Get validation split ratio (default to 0.1 if not specified)
+    val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+
+    # Create training dataset (90% of each file)
     print("\nCreating training dataset...")
     train_dataset = MultiFileStreamingDataset(
         file_paths=config['data']['train_files'],
@@ -127,28 +139,33 @@ def create_datasets(config):
         max_bonds=config['data']['max_bonds'],
         chunk_size=config['data'].get('chunk_size', 10000),
         cache_ram_mb=config['data'].get('cache_ram_mb', 4096),
-        training=True  # Enable rotation augmentation
+        training=True,  # Enable rotation augmentation
+        val_split_ratio=val_split_ratio,
+        split='train'
     )
 
     print(f"Training dataset created:")
     print(f"  Files: {len(train_dataset.file_paths)}")
     print(f"  Current file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
     print(f"  Bonds in current file: {len(train_dataset)}")
+    print(f"  Split: {int((1-val_split_ratio)*100)}% train / {int(val_split_ratio*100)}% val per file")
 
-    # Create validation dataset
+    # Create validation dataset (10% of each file)
     print("\nCreating validation dataset...")
     val_dataset = MultiFileStreamingDataset(
-        file_paths=[config['data']['val_file']],
+        file_paths=config['data']['train_files'],
         element_to_idx=element_to_idx,
         max_bonds=config['data']['max_bonds'],
         chunk_size=config['data'].get('chunk_size', 10000),
         cache_ram_mb=config['data'].get('cache_ram_mb', 4096),
-        training=False  # No augmentation for validation
+        training=False,  # No augmentation for validation
+        val_split_ratio=val_split_ratio,
+        split='val'
     )
-
     print(f"Validation dataset created:")
-    print(f"  File: {config['data']['val_file']}")
-    print(f"  Bonds: {len(val_dataset)}")
+    print(f"  Files: {len(val_dataset.file_paths)}")
+    print(f"  Current file: {val_dataset.file_paths[val_dataset.current_file_idx]}")
+    print(f"  Bonds in current file: {len(val_dataset)}")
 
     print("="*60 + "\n")
 
@@ -175,7 +192,8 @@ def create_model(config, device):
         hidden_dim=config['model']['hidden_dim'],
         max_bonds=config['model']['max_bonds'],
         vocab_size=config['model']['vocab_size'],
-        embedding_dim=config['model']['embedding_dim']
+        embedding_dim=config['model']['embedding_dim'],
+        depth=config['model'].get('depth', 1)
     ).to(device)
 
     # Initialize weights
@@ -188,6 +206,7 @@ def create_model(config, device):
     print(f"  Embedding dim: {config['model']['embedding_dim']}")
     print(f"  Vocabulary size: {config['model']['vocab_size']}")
     print(f"  Max bonds: {config['model']['max_bonds']}")
+    print(f"  Depth (GCN layers): {config['model'].get('depth', 1)}")
     print(f"  Total parameters: {num_params:,}")
 
     print("="*60 + "\n")
@@ -258,6 +277,68 @@ def create_optimizer_and_scheduler(model, config):
     return optimizer, scheduler
 
 
+def init_wandb(config, args):
+    """
+    Initialize Weights & Biases logging.
+
+    Args:
+        config: Configuration dict
+        args: Command-line arguments
+
+    Returns:
+        bool: True if wandb initialized successfully
+    """
+    use_wandb = config['logging'].get('use_wandb', False)
+
+    if not use_wandb:
+        return False
+
+    if not WANDB_AVAILABLE:
+        print("Warning: wandb requested in config but not installed.")
+        print("Install with: pip install wandb")
+        print("Continuing without wandb logging...")
+        return False
+
+    # Generate run name if not specified
+    run_name = config['logging'].get('wandb_run_name')
+    if not run_name:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        run_name = f"run-{timestamp}"
+
+    # Initialize wandb
+    wandb.init(
+        project=config['logging'].get('wandb_project', 'stereochem-gcn'),
+        entity=config['logging'].get('wandb_entity'),
+        name=run_name,
+        tags=config['logging'].get('wandb_tags', []),
+        notes=config['logging'].get('wandb_notes'),
+        config={
+            'batch_size': config['data']['batch_size'],
+            'learning_rate': config['training']['learning_rate'],
+            'num_epochs': config['training']['num_epochs'],
+            'hidden_dim': config['model']['hidden_dim'],
+            'embedding_dim': config['model']['embedding_dim'],
+            'max_bonds': config['model']['max_bonds'],
+            'depth': config['model'].get('depth', 1),
+            'val_split_ratio': config['data'].get('val_split_ratio', 0.0),
+            'weight_decay': config['training'].get('weight_decay', 0.001),
+            'grad_clip': config['training'].get('grad_clip', 1.0),
+            'loss_weights': {
+                'distance': config['loss']['distance_weight'],
+                'geometry': config['loss']['geometry_weight'],
+                'r': config['loss']['r_weight'],
+                'theta': config['loss']['theta_weight'],
+                'phi': config['loss']['phi_weight']
+            }
+        }
+    )
+
+    print(f"\nWandB initialized: {wandb.run.name}")
+    print(f"View at: {wandb.run.url}\n")
+
+    return True
+
+
 def main(args):
     """
     Main training function.
@@ -302,11 +383,17 @@ def main(args):
     # Create model
     model = create_model(config, device)
 
+    # Initialize wandb if enabled
+    use_wandb = init_wandb(config, args)
+
     # Create optimizer and scheduler
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
 
     # Create metrics logger
-    metrics_logger = MetricsLogger(log_dir=config['logging']['log_dir'])
+    metrics_logger = MetricsLogger(
+        log_dir=config['logging']['log_dir'],
+        use_wandb=use_wandb
+    )
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -363,6 +450,9 @@ def main(args):
         save_dir="models",
         filename="final_model.pt"
     )
+
+    # Finish wandb logging
+    metrics_logger.finish()
 
     print("\n" + "="*60)
     print("Training Complete!")
