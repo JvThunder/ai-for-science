@@ -52,6 +52,7 @@ from utils.dataset import MultiFileStreamingDataset, analyze_element_frequencies
 from utils.training import train_multi_file
 from utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from utils.metrics import MetricsLogger
+import json
 
 
 def set_random_seeds(seed: int = 42):
@@ -115,10 +116,21 @@ def create_datasets(config):
     print("Creating Datasets")
     print("="*60)
 
+    # Get all CSV files from train_folder
+    train_folder = Path(config['data']['train_folder'])
+    train_files = sorted(train_folder.glob('*.csv'))
+
+    if not train_files:
+        raise ValueError(f"No CSV files found in {train_folder}")
+
+    print(f"\nFound {len(train_files)} CSV files in {train_folder}")
+    for f in train_files:
+        print(f"  - {f.name}")
+
     # Analyze element frequencies across all training files
     print("\nAnalyzing element frequencies...")
     element_to_idx = analyze_element_frequencies(
-        config['data']['train_files'],
+        [str(f) for f in train_files],
         min_count=config['data'].get('min_element_count', 10)
     )
 
@@ -130,11 +142,12 @@ def create_datasets(config):
 
     # Get validation split ratio (default to 0.1 if not specified)
     val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+    use_fixed_validation = config['data'].get('use_fixed_validation', False)
 
     # Create training dataset (90% of each file)
     print("\nCreating training dataset...")
     train_dataset = MultiFileStreamingDataset(
-        file_paths=config['data']['train_files'],
+        file_paths=[str(f) for f in train_files],
         element_to_idx=element_to_idx,
         max_bonds=config['data']['max_bonds'],
         chunk_size=config['data'].get('chunk_size', 10000),
@@ -150,10 +163,20 @@ def create_datasets(config):
     print(f"  Bonds in current file: {len(train_dataset)}")
     print(f"  Split: {int((1-val_split_ratio)*100)}% train / {int(val_split_ratio*100)}% val per file")
 
-    # Create validation dataset (10% of each file)
+    # Create validation dataset
     print("\nCreating validation dataset...")
+    if use_fixed_validation:
+        # Use only the first file for validation (stays consistent across epochs)
+        val_files = [str(train_files[0])]
+        print(f"  Mode: FIXED validation (same molecules every epoch)")
+        print(f"  Using file: {train_files[0].name}")
+    else:
+        # Use all files for validation (cycles through files like training)
+        val_files = [str(f) for f in train_files]
+        print(f"  Mode: CYCLING validation (different molecules each epoch)")
+
     val_dataset = MultiFileStreamingDataset(
-        file_paths=config['data']['train_files'],
+        file_paths=val_files,
         element_to_idx=element_to_idx,
         max_bonds=config['data']['max_bonds'],
         chunk_size=config['data'].get('chunk_size', 10000),
@@ -212,6 +235,119 @@ def create_model(config, device):
     print("="*60 + "\n")
 
     return model
+
+
+def export_validation_ids_to_file(config, train_dataset, val_dataset):
+    """
+    Export validation molecule IDs to JSON file.
+
+    Args:
+        config: Configuration dict
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+    """
+    print("\n" + "="*60)
+    print("Exporting Validation IDs")
+    print("="*60)
+
+    output_path = Path(config['logging'].get('validation_ids_file', 'logs/validation_ids.json'))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Get validation split info for all files
+    all_validation_info = []
+
+    for file_idx, file_path in enumerate(train_dataset.file_paths):
+        # Get validation indices from the dataset's split logic
+        # We need to replicate the split logic to get the indices
+        import pandas as pd
+        import random as rand
+
+        # Read file to count valid molecules
+        df = pd.read_csv(file_path)
+        valid_indices = []
+
+        from utils.dataset import parse_xyz_string, parse_bonds_from_dataset
+
+        for idx, (_, row) in enumerate(df.iterrows()):
+            try:
+                if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
+                    continue
+                if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
+                    continue
+
+                coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+                bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+
+                if coordinates and len(coordinates) >= 2 and bonds_data:
+                    valid_indices.append(idx)
+            except Exception:
+                continue
+
+        # Apply same split logic as dataset
+        val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+        split_seed = config.get('random_seed', 42)
+
+        rng = rand.Random(split_seed + hash(file_path))
+        shuffled_indices = list(valid_indices)
+        rng.shuffle(shuffled_indices)
+
+        n_total = len(shuffled_indices)
+        n_val = int(n_total * val_split_ratio)
+        n_train = n_total - n_val
+
+        val_indices = sorted(shuffled_indices[n_train:])
+        train_indices = sorted(shuffled_indices[:n_train])
+
+        all_validation_info.append({
+            'file_idx': file_idx,
+            'file_path': str(file_path),
+            'file_name': Path(file_path).name,
+            'epoch_in_first_cycle': file_idx + 1,
+            'total_molecules': n_total,
+            'train_molecules': n_train,
+            'val_molecules': n_val,
+            'val_split_ratio': val_split_ratio,
+            'split_seed': split_seed,
+            'train_indices': train_indices,
+            'val_indices': val_indices
+        })
+
+        print(f"  File {file_idx + 1}/{len(train_dataset.file_paths)}: {Path(file_path).name}")
+        print(f"    Total: {n_total} | Train: {n_train} | Val: {n_val}")
+
+    # Create summary
+    total_train_molecules = sum(info['train_molecules'] for info in all_validation_info)
+    total_val_molecules = sum(info['val_molecules'] for info in all_validation_info)
+
+    summary = {
+        'config': {
+            'train_folder': config['data']['train_folder'],
+            'val_split_ratio': config['data'].get('val_split_ratio', 0.1),
+            'split_seed': config.get('random_seed', 42)
+        },
+        'summary': {
+            'total_files': len(train_dataset.file_paths),
+            'total_train_molecules': total_train_molecules,
+            'total_val_molecules': total_val_molecules,
+            'validation_behavior': (
+                "IMPORTANT: Validation set CHANGES across epochs because each file = 1 epoch. "
+                "The validation split is deterministic for each file (same molecules are always "
+                "in the validation set for a given file), but different files contain different "
+                "molecules. Therefore, epoch 1 uses validation molecules from file 0, epoch 2 "
+                "uses validation molecules from file 1, etc."
+            )
+        },
+        'files': all_validation_info
+    }
+
+    # Save to JSON
+    with open(output_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\nValidation IDs exported to: {output_path}")
+    print(f"Total train molecules (across all files): {total_train_molecules:,}")
+    print(f"Total val molecules (across all files): {total_val_molecules:,}")
+    print("="*60 + "\n")
 
 
 def create_optimizer_and_scheduler(model, config):

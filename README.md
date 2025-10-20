@@ -4,7 +4,7 @@ A Graph Convolutional Network for predicting local molecular geometry using cyli
 
 ##  Key Features
 
-- **Stereochemistry-Aware**: Uses cylindrical coordinates (r, θ, φ) in a bond-centered reference frame
+- **Stereochemistry-Aware**: Uses spherical coordinates (r, θ, φ) in a bond-centered reference frame
 - **Rotationally Invariant**: Ordered neighbor representation with azimuthal angles
 - **TB-Scale Ready**: Streaming dataset with NO RAM caching, handles terabytes of data
 - **File-Based Epochs**: Each CSV file = 1 epoch, automatic cycling through all files
@@ -19,9 +19,12 @@ A Graph Convolutional Network for predicting local molecular geometry using cyli
 ```
 new_implementation/
  config.yaml                        # Main configuration file
+ requirements.txt                   # Python package dependencies with versions
  local_geometry_gcn_stereo.py      # Main training script
+ export_validation_ids.py           # Utility to export validation molecule IDs
  README.md                          # This file
  IMPLEMENTATION_PROGRESS.md         # Detailed implementation log
+ VALIDATION_BEHAVIOR.md             # Explains validation set behavior across epochs
 
  utils/                             # Core modules
     geometry.py                    # Geometry computations (r, θ, φ)
@@ -47,20 +50,43 @@ new_implementation/
 
 ### 1. Installation
 
-Ensure you have the required dependencies:
+#### Environment Setup
 
+This project was developed and tested with the following package versions:
+
+**Option 1: Quick Install (Recommended)**
 ```bash
-# PyTorch with CUDA support (if available)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# Install PyTorch with CUDA 11.8 support
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 
-# PyTorch Geometric
-pip install torch-geometric
+# Install PyTorch Geometric and extensions
+pip install torch-geometric==2.6.1
+pip install torch-scatter==2.1.2 torch-sparse==0.6.18 torch-cluster==1.6.3 torch-spline-conv==1.2.2 --find-links https://data.pyg.org/whl/torch-2.7.0+cu118.html
 
-# Other dependencies
-pip install pandas numpy matplotlib pyyaml tqdm scikit-learn
+# Install remaining dependencies
+pip install pandas==2.2.3 numpy==1.26.4 pyyaml==6.0.2 tqdm==4.67.1 matplotlib==3.10.1 scikit-learn==1.7.0
 
 # Optional: Weights & Biases for experiment tracking
-pip install wandb
+pip install wandb==0.21.1
+```
+
+**Option 2: Using requirements.txt**
+```bash
+# Install PyTorch first (CUDA version)
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
+
+# Install PyG extensions
+pip install torch-scatter==2.1.2 torch-sparse==0.6.18 torch-cluster==1.6.3 torch-spline-conv==1.2.2 --find-links https://data.pyg.org/whl/torch-2.7.0+cu118.html
+
+# Install remaining dependencies
+pip install -r requirements.txt
+```
+
+**Note:** For CPU-only installation:
+```bash
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv --find-links https://data.pyg.org/whl/torch-2.7.0+cpu.html
+pip install -r requirements.txt
 ```
 
 ### 2. Data Preparation
@@ -103,17 +129,22 @@ training:
 Start training with:
 
 ```bash
-python local_geometry_gcn_stereo.py --config config.yaml
+python local_geometry_gcn_stereo.py
+```
+
+The script uses `config.yaml` by default. To specify a different config file:
+```bash
+python local_geometry_gcn_stereo.py --config custom_config.yaml
 ```
 
 Override config parameters:
 ```bash
-python local_geometry_gcn_stereo.py --config config.yaml --batch-size 64 --lr 0.001 --epochs 100
+python local_geometry_gcn_stereo.py --batch-size 64 --lr 0.001 --epochs 100
 ```
 
 Resume from checkpoint:
 ```bash
-python local_geometry_gcn_stereo.py --config config.yaml --resume checkpoints/best_model.pt
+python local_geometry_gcn_stereo.py --resume checkpoints/best_model.pt
 ```
 
 ### 5. Monitor Training
@@ -124,6 +155,70 @@ Training progress is logged to:
 - **logs/training_metrics.png**: Visualization plots
 - **checkpoints/**: Model checkpoints (saved after each epoch)
 - **Weights & Biases**: Online experiment tracking (optional, see below)
+
+### 6. Understanding Validation Behavior
+
+You can choose between **fixed** or **cycling** validation sets:
+
+#### **Option 1: Fixed Validation (Recommended - Default)**
+
+Set `use_fixed_validation: true` in `config.yaml` (enabled by default):
+
+```yaml
+data:
+  use_fixed_validation: true  # Validation stays on same molecules every epoch
+```
+
+**Behavior:**
+- Validation uses only the **first file** and stays fixed across all epochs
+- Same molecules are used for validation every epoch
+- Validation loss is **directly comparable** across epochs
+- Better for early stopping and model selection
+
+Example:
+- Epoch 1: Validates on 10% of file 0
+- Epoch 2: Validates on 10% of file 0 (same molecules)
+- Epoch 3: Validates on 10% of file 0 (same molecules)
+- ... and so on
+
+#### **Option 2: Cycling Validation**
+
+Set `use_fixed_validation: false` in `config.yaml`:
+
+```yaml
+data:
+  use_fixed_validation: false  # Validation cycles through files
+```
+
+**Behavior:**
+- Validation cycles through files just like training (each file = 1 epoch)
+- Different molecules are used for validation each epoch
+- Validation loss is **not directly comparable** across epochs
+- Provides diverse evaluation across the dataset
+
+Example:
+- Epoch 1: Validates on 10% of file 0
+- Epoch 2: Validates on 10% of file 1 (different molecules)
+- Epoch 3: Validates on 10% of file 2 (different molecules)
+- ... and so on
+
+#### **Validation Tracking**
+
+Set `export_validation_ids: true` in `config.yaml` (enabled by default):
+```yaml
+logging:
+  export_validation_ids: true
+  validation_ids_file: "logs/validation_ids.json"
+```
+
+This automatically creates a JSON file **after the first epoch cycle** showing which molecule indices are used for validation. The tracking happens incrementally during training (not upfront), so there's no startup delay.
+
+**Manual Export (if needed):**
+```bash
+python export_validation_ids.py --config config.yaml --output logs/validation_ids.json
+```
+
+**For more details**, see [`VALIDATION_BEHAVIOR.md`](VALIDATION_BEHAVIOR.md)
 
 ##  Weights & Biases Integration
 
@@ -169,8 +264,9 @@ Wandb automatically tracks:
 
 **Option 1: Use config file (default)**
 ```bash
-python local_geometry_gcn_stereo.py --config config.yaml
-# Wandb enabled by default, view at the URL printed in console
+python local_geometry_gcn_stereo.py
+# Uses config.yaml by default, wandb enabled by default
+# View at the URL printed in console
 ```
 
 **Option 2: Disable wandb temporarily**
@@ -210,10 +306,10 @@ Visit that URL to see:
 **Compare Multiple Runs:**
 ```bash
 # Run 1: Baseline
-python local_geometry_gcn_stereo.py --config config.yaml --lr 0.0001
+python local_geometry_gcn_stereo.py --lr 0.0001
 
 # Run 2: Higher LR
-python local_geometry_gcn_stereo.py --config config.yaml --lr 0.001
+python local_geometry_gcn_stereo.py --lr 0.001
 
 # View both runs in wandb dashboard and compare
 ```
@@ -246,7 +342,7 @@ wandb agent USERNAME/PROJECT/SWEEP_ID  # Starts agents
 **Offline Mode** (no internet):
 ```bash
 export WANDB_MODE=offline
-python local_geometry_gcn_stereo.py --config config.yaml
+python local_geometry_gcn_stereo.py
 # Logs saved locally, sync later with: wandb sync
 ```
 
@@ -301,7 +397,7 @@ Geometry Head: Individual embeddings → max_bonds * 3 (r, θ, φ per neighbor)
 
 ##  Key Concepts
 
-### Cylindrical Coordinates (r, θ, φ)
+### Spherical Coordinates (r, θ, φ)
 
 Instead of predicting absolute 3D positions, we predict geometry in a **bond-centered coordinate system**:
    
@@ -378,43 +474,171 @@ python tests/test_model.py         # Model architecture (7 tests)
 python tests/test_dataset_quick.py # Dataset streaming
 ```
 
-##  Configuration Options
+##  Command-Line Arguments
 
-### Data
-- `train_files`: List of training CSV files
-- `val_split_ratio`: Fraction of each file for validation, randomly sampled (default: 0.1)
-- `batch_size`: Training batch size (default: 32)
-- `max_bonds`: Maximum bonds per atom (default: 7)
-- `chunk_size`: CSV chunk size for streaming (default: 10000)
-- `cache_ram_mb`: RAM limit for chunk caching (default: 4096)
+The training script supports the following command-line arguments:
 
-### Model
-- `hidden_dim`: GCN hidden dimension (default: 64)
-- `embedding_dim`: Element embedding dimension (default: 32)
-- `vocab_size`: Auto-detected from data
+```bash
+python local_geometry_gcn_stereo.py [OPTIONS]
+```
 
-### Training
-- `num_epochs`: Number of cycles through all files (default: 50)
-- `learning_rate`: Adam learning rate (default: 0.0001)
-- `weight_decay`: L2 regularization (default: 0.001)
-- `grad_clip`: Gradient clipping max norm (default: 1.0)
-- `early_stopping_patience`: Epochs without improvement (default: 5)
-- `lr_scheduler`: 'plateau', 'step', 'cosine', or null
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--config` | str | `config.yaml` | Path to YAML configuration file |
+| `--resume` | str | None | Path to checkpoint file to resume training from |
+| `--batch-size` | int | None | Override batch size from config |
+| `--lr` | float | None | Override learning rate from config |
+| `--epochs` | int | None | Override number of epochs from config |
 
-### Loss
-- `distance_weight`: Weight for A-B distance loss (default: 1.0)
-- `geometry_weight`: Weight for (r, θ, φ) loss (default: 0.3)
-- `r_weight`, `theta_weight`, `phi_weight`: Individual geometry weights
+**Examples:**
+```bash
+# Basic training (uses config.yaml by default)
+python local_geometry_gcn_stereo.py
 
-### Logging
-- `log_dir`: Directory for logs and plots (default: "logs")
-- `log_every`: Log metrics every N batches (default: 10)
-- `use_wandb`: Enable Weights & Biases tracking (default: true)
-- `wandb_project`: WandB project name (default: "stereochem-gcn")
-- `wandb_entity`: WandB username or team (optional)
-- `wandb_run_name`: Custom run name (auto-generated if null)
-- `wandb_tags`: List of tags for organizing runs
-- `wandb_notes`: Optional notes about the run
+# Custom config file
+python local_geometry_gcn_stereo.py --config my_config.yaml
+
+# Override specific parameters
+python local_geometry_gcn_stereo.py --batch-size 64 --lr 0.001 --epochs 100
+
+# Resume from checkpoint
+python local_geometry_gcn_stereo.py --resume checkpoints/best_model.pt
+
+# Combine options
+python local_geometry_gcn_stereo.py --config my_config.yaml --batch-size 128 --resume checkpoints/checkpoint_epoch_0050.pt
+```
+
+##  Configuration File (`config.yaml`)
+
+All training parameters can be configured in `config.yaml`. Command-line arguments override config values.
+
+### Data Configuration (`data:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `train_folder` | str | `"./data"` | Directory containing CSV files. Each file = 1 epoch |
+| `val_split_ratio` | float | `0.1` | Fraction of each file for validation (0.0-1.0). E.g., 0.1 = 90% train / 10% val |
+| `use_fixed_validation` | bool | `true` | **NEW** If true, validation uses only first file (same molecules every epoch). If false, validation cycles through files |
+| `max_bonds` | int | `7` | Maximum bonds per atom (for padding geometry predictions) |
+| `batch_size` | int | `512` | Training batch size. Adjust based on available GPU memory |
+| `num_workers` | int | `4` | Number of parallel data loading workers (0 to disable multiprocessing) |
+| `prefetch_factor` | int | `1` | Number of batches to prefetch per worker |
+| `chunk_size` | int | `10000` | Number of CSV rows to read per chunk (memory efficiency) |
+| `cache_ram_mb` | int | `2048` | RAM limit for chunk caching in MB (trades RAM for speed) |
+| `min_element_count` | int | `10` | Minimum element occurrences to include in vocabulary |
+
+### Model Architecture (`model:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `hidden_dim` | int | `32` | Hidden dimension for GCN layers |
+| `embedding_dim` | int | `16` | Element embedding dimension |
+| `vocab_size` | int | null | Vocabulary size (set automatically from data) |
+| `max_bonds` | int | `7` | Maximum bonds (should match `data.max_bonds`) |
+| `depth` | int | `1` | Number of GCN layers (1=1-hop neighbors, 2=2-hop, etc.) |
+
+### Training Configuration (`training:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `num_epochs` | int | `2` | Number of cycles through all files |
+| `learning_rate` | float | `0.0001` | Initial learning rate for Adam optimizer |
+| `weight_decay` | float | `0.001` | L2 regularization weight decay |
+| `grad_clip` | float | `1.0` | Gradient clipping max norm (prevents exploding gradients) |
+| `early_stopping_patience` | int | `5` | Epochs without improvement before stopping |
+| `validate_every` | int | `1` | Validate every N epochs |
+| `lr_scheduler` | str | `"plateau"` | LR scheduler: `"plateau"`, `"step"`, `"cosine"`, or `null` |
+| `lr_scheduler_params` | dict | See below | Parameters for the LR scheduler |
+
+**LR Scheduler Parameters (`lr_scheduler_params:`):**
+
+For `lr_scheduler: "plateau"`:
+- `factor` (float, default: 0.7): Reduce LR by this factor
+- `patience` (int, default: 2): Epochs without improvement before reducing LR
+- `mode` (str, default: "min"): Optimize for minimum loss
+
+For `lr_scheduler: "step"`:
+- `step_size` (int, default: 10): Reduce LR every N epochs
+- `gamma` (float, default: 0.7): Multiply LR by this factor
+
+For `lr_scheduler: "cosine"`:
+- `T_max` (int, default: num_epochs): Period of cosine annealing
+- `eta_min` (float, default: 1e-6): Minimum learning rate
+
+### Loss Function Weights (`loss:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `distance_weight` | float | `1.0` | Weight for A-B distance prediction loss |
+| `geometry_weight` | float | `1.0` | Weight for overall geometry (r, θ, φ) loss |
+| `r_weight` | float | `1.0` | Weight for radial distance (r) component |
+| `theta_weight` | float | `1.0` | Weight for polar angle (θ) component |
+| `phi_weight` | float | `1.0` | Weight for azimuthal angle (φ) component |
+
+**Note:** All losses use percentage-based metrics for scale invariance.
+
+### Checkpointing (`checkpointing:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `checkpoint_dir` | str | `"checkpoints"` | Directory to save model checkpoints |
+| `save_every` | int | `1` | Save checkpoint every N epochs |
+| `keep_last_n` | int | `1` | Keep only N most recent checkpoints (saves disk space) |
+
+### Logging (`logging:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `log_dir` | str | `"logs"` | Directory for logs and plots |
+| `log_every` | int | `10` | Log metrics every N batches during training |
+| `export_validation_ids` | bool | `true` | Export validation molecule IDs to JSON file |
+| `validation_ids_file` | str | `"logs/validation_ids.json"` | Path to validation IDs output file |
+| `use_wandb` | bool | `true` | Enable Weights & Biases experiment tracking |
+| `wandb_project` | str | `"stereochem-gcn"` | WandB project name |
+| `wandb_entity` | str | `null` | WandB username or team (optional) |
+| `wandb_run_name` | str | `null` | Custom run name (auto-generated if null) |
+| `wandb_tags` | list | `[]` | List of tags for organizing runs (e.g., `["baseline", "experiment1"]`) |
+| `wandb_notes` | str | `null` | Optional notes about the run |
+
+### Hardware (`hardware:`)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `device` | str | `"cuda"` | Device: `"cuda"`, `"cpu"`, or `"auto"` (auto-detect) |
+| `mixed_precision` | bool | `false` | Enable mixed precision training (if supported) |
+
+### Reproducibility
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `random_seed` | int | `42` | Random seed for reproducibility (affects train/val splits, augmentation) |
+
+### Example Configuration
+
+```yaml
+# Minimal config for quick testing
+data:
+  train_folder: "./data"
+  val_split_ratio: 0.1
+  batch_size: 32
+  num_workers: 0  # Disable multiprocessing for debugging
+
+model:
+  hidden_dim: 32
+  embedding_dim: 16
+  depth: 1
+
+training:
+  num_epochs: 10
+  learning_rate: 0.0001
+  lr_scheduler: "plateau"
+
+logging:
+  use_wandb: false  # Disable for quick local runs
+  export_validation_ids: true
+
+random_seed: 42
+```
 
 ##  Advanced Usage
 
@@ -438,7 +662,7 @@ ordered_indices, geometry, frame = compute_local_geometry(
 # geometry = [(r, θ, φ), ...] for each neighbor
 # frame = (x_axis, y_axis, bond_axis) orthonormal coordinate system
 
-# Reconstruct 3D position from cylindrical coordinates
+# Reconstruct 3D position from spherical coordinates
 r, theta, phi = geometry[0]
 reconstructed_pos = spherical_to_cartesian(r, theta, phi, frame, pos[0])
 ```

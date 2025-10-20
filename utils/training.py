@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple
 import time
 
 from .loss import total_loss, compute_angle_errors
+import json
+from pathlib import Path
 
 
 def compute_batch_loss(
@@ -259,6 +261,138 @@ def validate_on_file(
     return metrics
 
 
+def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, config):
+    """
+    Get validation info for the currently loaded file (lazy evaluation).
+
+    Args:
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        file_idx: Current file index
+        config: Configuration dict
+
+    Returns:
+        Dictionary with validation info for this file
+    """
+    # Get current file path
+    current_file = train_dataset.file_paths[train_dataset.current_file_idx]
+
+    # Get validation indices from dataset's internal metadata
+    # The dataset has already computed the split, so we just extract it
+    val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+
+    # Read validation molecule indices from the dataset
+    # The dataset stores valid_molecule_indices as (chunk_idx, row_in_chunk, bond_count)
+    # We need to map these back to original row indices
+
+    import pandas as pd
+    import random as rand
+    from .dataset import parse_xyz_string, parse_bonds_from_dataset
+
+    # Read file to get original indices
+    df = pd.read_csv(current_file)
+    valid_indices = []
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        try:
+            if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
+                continue
+            if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
+                continue
+
+            coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+            bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+
+            if coordinates and len(coordinates) >= 2 and bonds_data:
+                valid_indices.append(idx)
+        except Exception:
+            continue
+
+    # Apply same split logic as dataset
+    split_seed = config.get('random_seed', 42)
+    rng = rand.Random(split_seed + hash(current_file))
+    shuffled_indices = list(valid_indices)
+    rng.shuffle(shuffled_indices)
+
+    n_total = len(shuffled_indices)
+    n_val = int(n_total * val_split_ratio)
+    n_train = n_total - n_val
+
+    val_indices = sorted(shuffled_indices[n_train:])
+    train_indices = sorted(shuffled_indices[:n_train])
+
+    return {
+        'file_idx': file_idx,
+        'file_path': str(current_file),
+        'file_name': Path(current_file).name,
+        'epoch_in_first_cycle': file_idx + 1,
+        'total_molecules': n_total,
+        'train_molecules': n_train,
+        'val_molecules': n_val,
+        'val_split_ratio': val_split_ratio,
+        'split_seed': split_seed,
+        'train_indices': train_indices,
+        'val_indices': val_indices
+    }
+
+
+def _save_validation_ids(validation_info_list, config):
+    """
+    Save validation IDs to JSON file.
+
+    Args:
+        validation_info_list: List of validation info dicts
+        config: Configuration dict
+    """
+    output_path = Path(config['logging'].get('validation_ids_file', 'logs/validation_ids.json'))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total_train_molecules = sum(info['train_molecules'] for info in validation_info_list)
+    total_val_molecules = sum(info['val_molecules'] for info in validation_info_list)
+
+    use_fixed_validation = config['data'].get('use_fixed_validation', False)
+
+    summary = {
+        'config': {
+            'train_folder': config['data']['train_folder'],
+            'val_split_ratio': config['data'].get('val_split_ratio', 0.1),
+            'split_seed': config.get('random_seed', 42),
+            'use_fixed_validation': use_fixed_validation
+        },
+        'summary': {
+            'total_files': len(validation_info_list),
+            'total_train_molecules': total_train_molecules,
+            'total_val_molecules': total_val_molecules,
+            'validation_behavior': (
+                f"FIXED VALIDATION: Validation uses only file 0 across all epochs (same molecules every epoch)."
+                if use_fixed_validation else
+                "CYCLING VALIDATION: Validation set CHANGES across epochs because each file = 1 epoch. "
+                "The validation split is deterministic for each file (same molecules are always "
+                "in the validation set for a given file), but different files contain different "
+                "molecules. Therefore, epoch 1 uses validation molecules from file 0, epoch 2 "
+                "uses validation molecules from file 1, etc."
+            )
+        },
+        'files': validation_info_list
+    }
+
+    with open(output_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\n{'='*60}")
+    print("Validation IDs Saved")
+    print(f"{'='*60}")
+    print(f"Output: {output_path}")
+    print(f"Total train molecules: {total_train_molecules:,}")
+    print(f"Total val molecules: {total_val_molecules:,}")
+    if use_fixed_validation:
+        print(f"\nMode: FIXED validation (same molecules every epoch)")
+        print(f"Validation file: {validation_info_list[0]['file_name']}")
+    else:
+        print(f"\nMode: CYCLING validation (different molecules each epoch)")
+    print(f"{'='*60}\n")
+
+
 def train_multi_file(
     model: nn.Module,
     train_dataset,
@@ -343,6 +477,10 @@ def train_multi_file(
     total_files = len(train_dataset.file_paths)
     global_epoch = 0
 
+    # Validation ID tracking (built incrementally during first cycle)
+    validation_info_list = []
+    export_validation_ids = config['logging'].get('export_validation_ids', False)
+
     for cycle in range(config['training']['num_epochs']):
         print(f"\n{'='*60}")
         print(f"Cycle {cycle + 1}/{config['training']['num_epochs']}")
@@ -356,8 +494,25 @@ def train_multi_file(
             if file_idx > 0:  # Skip first file (already loaded)
                 print(f"\nSwitching to file {file_idx + 1}/{total_files}...")
                 train_dataset.next_file()
-                # Also switch validation dataset to the same file
-                val_dataset.next_file()
+
+                # Conditionally switch validation dataset
+                use_fixed_validation = config['data'].get('use_fixed_validation', False)
+                if not use_fixed_validation:
+                    # Cycle validation dataset (validation molecules change each epoch)
+                    val_dataset.next_file()
+                else:
+                    # Keep validation dataset fixed (same molecules every epoch)
+                    print(f"  Validation stays on: {val_dataset.file_paths[val_dataset.current_file_idx]}")
+
+            # Track validation info during first cycle
+            if cycle == 0 and export_validation_ids:
+                val_info = _get_validation_info_for_current_file(
+                    train_dataset,
+                    val_dataset,
+                    file_idx,
+                    config
+                )
+                validation_info_list.append(val_info)
 
             # Create dataloaders for current file
             # Use multiprocessing for faster data loading
@@ -487,6 +642,10 @@ def train_multi_file(
                     },
                     lr=current_lr
                 )
+
+        # End of file loop - save validation IDs after first cycle
+        if cycle == 0 and export_validation_ids and len(validation_info_list) > 0:
+            _save_validation_ids(validation_info_list, config)
 
     print(f"\n{'='*60}")
     print("Training completed!")

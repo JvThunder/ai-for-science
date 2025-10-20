@@ -9,7 +9,7 @@ Provides functions for:
 
 Example config.yaml structure:
     data:
-      train_files: ["file1.csv", "file2.csv"]
+      train_folder: "./data"
       val_split_ratio: 0.1
       max_bonds: 7
       batch_size: 32
@@ -88,7 +88,7 @@ def get_default_config() -> Dict[str, Any]:
     """
     config = {
         'data': {
-            'train_files': ['../Compound_000000001_000025000_props_geom.csv'],
+            'train_folder': './data',
             'val_split_ratio': 0.1,  # Fraction of each file for validation
             'max_bonds': 7,
             'batch_size': 32,
@@ -184,13 +184,21 @@ def validate_config(config: Dict[str, Any]) -> bool:
 
     # Validate data section
     data_config = config['data']
-    if 'train_files' not in data_config or len(data_config['train_files']) == 0:
-        raise ValueError("data.train_files must be specified and non-empty")
+    if 'train_folder' not in data_config or not data_config['train_folder']:
+        raise ValueError("data.train_folder must be specified and non-empty")
 
-    # Check that files exist
-    for train_file in data_config['train_files']:
-        if not os.path.exists(train_file):
-            raise ValueError(f"Training file not found: {train_file}")
+    # Check that folder exists
+    train_folder = Path(data_config['train_folder'])
+    if not train_folder.exists():
+        raise ValueError(f"Training folder not found: {train_folder}")
+
+    if not train_folder.is_dir():
+        raise ValueError(f"train_folder must be a directory: {train_folder}")
+
+    # Check that folder contains at least one CSV file
+    csv_files = list(train_folder.glob('*.csv'))
+    if not csv_files:
+        raise ValueError(f"No CSV files found in training folder: {train_folder}")
 
     # Validate val_split_ratio if specified
     val_split_ratio = data_config.get('val_split_ratio', 0.1)
