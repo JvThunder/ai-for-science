@@ -336,6 +336,25 @@ class MultiFileStreamingDataset(Dataset):
                     if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
                         continue
 
+                    # Filter: Only use molecules with bonding_status="OK" AND bonding_issues_atoms=[]
+                    if 'bonding_status' not in row or row['bonding_status'] != 'OK':
+                        continue
+
+                    # Check bonding_issues_atoms is empty list
+                    if 'bonding_issues_atoms' in row:
+                        try:
+                            issues = row['bonding_issues_atoms']
+                            # Parse JSON if it's a string
+                            if isinstance(issues, str):
+                                issues = json.loads(issues) if issues.strip() else []
+                            # Skip if not an empty list
+                            if not isinstance(issues, list) or len(issues) > 0:
+                                continue
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                    else:
+                        continue  # Skip if bonding_issues_atoms column doesn't exist
+
                     # Parse to validate
                     coordinates, elements = parse_xyz_string(row['geometry_xyz'])
                     if not coordinates or len(coordinates) < 2:
