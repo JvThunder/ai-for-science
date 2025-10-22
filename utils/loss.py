@@ -10,9 +10,9 @@ This module implements specialized loss functions for training the model:
 
 Key Features:
 - Distance: Percentage error loss (relative to target value)
-- Angles (θ, φ): Normalized by 360° for consistent [0, 1] range
-  - Example: 36° error → 36/360 = 0.1 loss
-  - Example: 180° error → 180/360 = 0.5 loss
+- Angles (θ, φ): Normalized for consistent [0, 1] range
+  - θ: Normalized by 180° (range [0, 180]) - Example: 90° error → 90/180 = 0.5 loss
+  - φ: Normalized by 360° (range [0, 360]) - Example: 36° error → 36/360 = 0.1 loss
 - Circular loss: properly handles φ angle wraparound (0° = 360°)
 - All angles in degrees (θ ∈ [0, 180], φ ∈ [0, 360])
 - Masking: handles variable number of bonds per atom
@@ -110,8 +110,8 @@ def circular_angle_loss(
     # Absolute error in degrees
     abs_diff = torch.abs(diff)
 
-    # Normalize by full circle (360°) to get [0, 1] range
-    normalized_error = abs_diff / 360.0
+    # Normalize by period to get [0, 1] range
+    normalized_error = abs_diff / period
 
     # Apply mask if provided
     if mask is not None:
@@ -155,7 +155,7 @@ def geometry_loss(
 
     Note:
         - r: Uses percentage loss (scale-invariant)
-        - θ: Normalized by 360° (so 36° error = 0.1 loss)
+        - θ: Normalized by 180° (so 90° error = 0.5 loss, θ range is [0, 180])
         - φ: Normalized by 360° with circular wraparound (so 36° error = 0.1 loss)
     """
     if weights is None:
@@ -174,9 +174,9 @@ def geometry_loss(
     loss_r = percentage_loss(pred_r, target_r, epsilon=1e-3, reduction='none')
     loss_r = loss_r * mask  # Apply mask
 
-    # Loss for θ (polar angle) - normalized by 360 degrees
+    # Loss for θ (polar angle) - normalized by 180 degrees (θ range is [0, 180])
     theta_diff = torch.abs(pred_theta - target_theta)
-    loss_theta = (theta_diff / 360.0) * mask  # Normalize by 360°
+    loss_theta = (theta_diff / 180.0) * mask  # Normalize by 180°
 
     # Loss for φ (azimuthal angle) - circular loss normalized by 360°
     loss_phi = circular_angle_loss(pred_phi, target_phi, mask=mask, period=360.0, reduction='none')
@@ -317,9 +317,9 @@ def compute_angle_errors(
 
     Args:
         pred_angles: Predicted angles in degrees
-        target_angles: Target angles in degrees
+        target_angles: Target angles in degrees (converted from radians in dataset)
         mask: Valid angle mask
-        angle_type: 'regular' for θ, 'circular' for φ
+        angle_type: 'regular' for θ (non-periodic), 'circular' for φ (periodic)
 
     Returns:
         stats: Dictionary with 'mae' and 'rmse' in degrees

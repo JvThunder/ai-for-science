@@ -21,6 +21,7 @@ from typing import List, Dict, Optional, Tuple
 import json
 import glob
 import random
+import math
 from tqdm import tqdm
 import sys
 import os
@@ -337,23 +338,24 @@ class MultiFileStreamingDataset(Dataset):
                         continue
 
                     # Filter: Only use molecules with bonding_status="OK" AND bonding_issues_atoms=[]
-                    if 'bonding_status' not in row or row['bonding_status'] != 'OK':
+                    if row['bonding_status'] != 'OK':
                         continue
 
-                    # Check bonding_issues_atoms is empty list
-                    if 'bonding_issues_atoms' in row:
+                    # Check bonding_issues_atoms is empty list (it's a JSON string, not a list)
+                    if 'bonding_issues_atoms' in row and not pd.isna(row['bonding_issues_atoms']):
+                        issues_str = row['bonding_issues_atoms']
+                        # Parse JSON string to list
                         try:
-                            issues = row['bonding_issues_atoms']
-                            # Parse JSON if it's a string
-                            if isinstance(issues, str):
-                                issues = json.loads(issues) if issues.strip() else []
-                            # Skip if not an empty list
-                            if not isinstance(issues, list) or len(issues) > 0:
+                            if isinstance(issues_str, str):
+                                issues_list = json.loads(issues_str)
+                            else:
+                                issues_list = issues_str
+                            # Skip if there are any bonding issues
+                            if issues_list and len(issues_list) > 0:
                                 continue
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, TypeError):
+                            # If we can't parse it, skip this molecule to be safe
                             continue
-                    else:
-                        continue  # Skip if bonding_issues_atoms column doesn't exist
 
                     # Parse to validate
                     coordinates, elements = parse_xyz_string(row['geometry_xyz'])
@@ -676,11 +678,15 @@ class MultiFileStreamingDataset(Dataset):
             frame_b = None
 
         # Pack geometry into tensors (r, θ, φ) for up to max_bonds
+        # NOTE: convert angles from radians to degrees for model/loss compatibility
         geometry_a_padded = []
         for i in range(self.max_bonds):
             if i < len(geometry_a):
                 r, theta, phi = geometry_a[i]
-                geometry_a_padded.append([r, theta, phi])
+                # Convert angles from radians to degrees
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                geometry_a_padded.append([r, theta_deg, phi_deg])
             else:
                 geometry_a_padded.append([0.0, 0.0, 0.0])  # Padding
 
@@ -688,7 +694,10 @@ class MultiFileStreamingDataset(Dataset):
         for i in range(self.max_bonds):
             if i < len(geometry_b):
                 r, theta, phi = geometry_b[i]
-                geometry_b_padded.append([r, theta, phi])
+                # Convert angles from radians to degrees
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                geometry_b_padded.append([r, theta_deg, phi_deg])
             else:
                 geometry_b_padded.append([0.0, 0.0, 0.0])  # Padding
 
@@ -709,8 +718,8 @@ class MultiFileStreamingDataset(Dataset):
             node_a=new_node_a,
             node_b=new_node_b,
             target_distance=torch.tensor([target_distance], dtype=torch.float),
-            target_geometry_a=torch.tensor(geometry_a_padded, dtype=torch.float),  # (max_bonds, 3)
-            target_geometry_b=torch.tensor(geometry_b_padded, dtype=torch.float),  # (max_bonds, 3)
+            target_geometry_a=torch.tensor(geometry_a_padded, dtype=torch.float),  # (max_bonds, 3): (r, θ°, φ°)
+            target_geometry_b=torch.tensor(geometry_b_padded, dtype=torch.float),  # (max_bonds, 3): (r, θ°, φ°)
             bond_mask_a=bond_mask_a,
             bond_mask_b=bond_mask_b
         )
