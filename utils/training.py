@@ -4,10 +4,10 @@ Training utilities for multi-file streaming dataset training.
 This module provides training and validation functions optimized for TB-scale
 datasets that don't fit in RAM. Key features:
 
-- Multi-file training: Each file = 1 epoch, cycle through all files
+- Multi-file training: 1 epoch = all files, 1 iteration = 1 file
 - Streaming: No data caching, everything read from disk
-- File cycling: Dataset switches to next file after each epoch
-- Checkpoint after each file: Resume training mid-cycle
+- File iteration: Dataset switches to next file after each iteration
+- Checkpoint after each epoch: Resume training easily
 - Early stopping: Prevent overfitting with validation monitoring
 
 Functions:
@@ -96,7 +96,7 @@ def train_epoch(
 
     pbar = tqdm(
         train_loader,
-        desc=f"Epoch {epoch} [File {file_idx+1}/{total_files}] Training",
+        desc=f"Epoch {epoch+1} [File {file_idx+1}/{total_files}] Training",
         leave=False,
         total=max_batches if max_batches else len(train_loader)
     )
@@ -154,18 +154,11 @@ def validate_on_file(
     compute_detailed_metrics: bool = False
 ) -> Dict[str, float]:
     """
-    Validate model on validation set.
-
-    Args:
-        model: The LocalGeometryGCN model
-        val_loader: DataLoader for validation data
-        device: Device to run on
-        config: Configuration dict
-        compute_detailed_metrics: If True, compute angle MAE/RMSE
-
-    Returns:
-        metrics: Dictionary with validation metrics
+    Validate model on validation set (streaming-safe version).
+    Computes metrics incrementally to avoid large tensor concatenations.
     """
+    import gc, psutil, os
+    
     model.eval()
 
     total_loss = 0.0
@@ -173,57 +166,64 @@ def validate_on_file(
     total_geometry_loss = 0.0
     num_batches = 0
 
-    # For detailed metrics
-    all_pred_distances = []
-    all_target_distances = []
-    all_pred_theta_a = []
-    all_target_theta_a = []
-    all_mask_a = []
+    # Running sums for detailed metrics
+    mae_sum = 0.0
+    rmse_sum = 0.0
+    mae_angle_sum = 0.0
+    rmse_angle_sum = 0.0
+    total_samples = 0
 
-    # Check for max validation batches limit (for testing)
     max_val_batches = config['training'].get('max_val_batches', None)
 
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validation", leave=False,
-                   total=max_val_batches if max_val_batches else len(val_loader))
+        pbar = tqdm(
+            val_loader,
+            desc="Validation",
+            leave=False,
+            total=max_val_batches if max_val_batches else len(val_loader)
+        )
         for batch_idx, data in enumerate(pbar):
             if max_val_batches and batch_idx >= max_val_batches:
                 break
-            # Compute loss
-            loss_dict = compute_batch_loss(model, data, device, config)
 
-            # Accumulate losses
+            loss_dict = compute_batch_loss(model, data, device, config)
             total_loss += loss_dict['total'].item()
             total_distance_loss += loss_dict['distance'].item()
             total_geometry_loss += loss_dict['geometry'].item()
             num_batches += 1
 
-            # Store predictions for detailed metrics
             if compute_detailed_metrics:
                 data = data.to(device)
                 pred_dist, pred_geom_a, pred_geom_b = model(data)
 
-                # Get batch size and max_bonds for reshaping
                 batch_size = data.num_graphs
                 max_bonds = config['data']['max_bonds']
 
-                # Reshape target_geometry_a from (batch_size * max_bonds, 3) to (batch_size, max_bonds, 3)
                 target_geom_a = data.target_geometry_a.view(batch_size, max_bonds, 3)
                 bond_mask_a = data.bond_mask_a.view(batch_size, max_bonds)
 
-                all_pred_distances.append(pred_dist.cpu())
-                all_target_distances.append(data.target_distance.cpu())
-                all_pred_theta_a.append(pred_geom_a[:, :, 1].cpu())
-                all_target_theta_a.append(target_geom_a[:, :, 1].cpu())
-                all_mask_a.append(bond_mask_a.cpu())
+                # Compute batch-wise MAE/RMSE for distances
+                diff = pred_dist - data.target_distance
+                mae_sum += torch.sum(torch.abs(diff)).item()
+                rmse_sum += torch.sum(diff ** 2).item()
+                total_samples += diff.numel()
 
-            # Update progress bar
-            if num_batches > 0:
-                pbar.set_postfix({
-                    'Val Loss': f"{total_loss/num_batches:.4f}"
-                })
+                # Compute angle stats incrementally (θ only)
+                pred_theta = pred_geom_a[:, :, 1]
+                target_theta = target_geom_a[:, :, 1]
+                mask = bond_mask_a
 
-    # Compute averages
+                angle_stats = compute_angle_errors(
+                    pred_theta.view(-1),
+                    target_theta.view(-1),
+                    mask.view(-1),
+                    angle_type='regular'
+                )
+                mae_angle_sum += angle_stats['mae'] * mask.sum().item()
+                rmse_angle_sum += (angle_stats['rmse'] ** 2) * mask.sum().item()
+
+            pbar.set_postfix({'Val Loss': f"{total_loss/num_batches:.4f}"})
+
     metrics = {
         'total_loss': total_loss / num_batches if num_batches > 0 else 0.0,
         'distance_loss': total_distance_loss / num_batches if num_batches > 0 else 0.0,
@@ -231,32 +231,21 @@ def validate_on_file(
         'num_batches': num_batches
     }
 
-    # Compute detailed metrics if requested
-    if compute_detailed_metrics and len(all_pred_distances) > 0:
-        # Distance metrics
-        pred_dist = torch.cat(all_pred_distances)
-        target_dist = torch.cat(all_target_distances)
+    # Compute final aggregated detailed metrics
+    if compute_detailed_metrics and total_samples > 0:
+        metrics['distance_mae'] = mae_sum / total_samples
+        metrics['distance_rmse'] = (rmse_sum / total_samples) ** 0.5
+        if mae_angle_sum > 0:
+            metrics['theta_mae_deg'] = mae_angle_sum / total_samples
+            metrics['theta_rmse_deg'] = (rmse_angle_sum / total_samples) ** 0.5
 
-        mae_dist = torch.mean(torch.abs(pred_dist - target_dist)).item()
-        rmse_dist = torch.sqrt(torch.mean((pred_dist - target_dist) ** 2)).item()
+    # Free memory after validation
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-        metrics['distance_mae'] = mae_dist
-        metrics['distance_rmse'] = rmse_dist
-
-        # Angle metrics (θ only, for simplicity)
-        pred_theta = torch.cat(all_pred_theta_a)
-        target_theta = torch.cat(all_target_theta_a)
-        mask = torch.cat(all_mask_a)
-
-        angle_stats = compute_angle_errors(
-            pred_theta.view(-1),
-            target_theta.view(-1),
-            mask.view(-1),
-            angle_type='regular'
-        )
-
-        metrics['theta_mae_deg'] = angle_stats['mae']
-        metrics['theta_rmse_deg'] = angle_stats['rmse']
+    mem_gb = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+    print(f"[Validation] Memory usage after cleanup: {mem_gb:.2f} GB")
 
     return metrics
 
@@ -402,13 +391,17 @@ def train_multi_file(
     device: torch.device,
     config: Dict,
     checkpoint_callback = None,
-    metrics_logger = None
+    metrics_logger = None,
+    start_iteration: int = 0
 ) -> Dict[str, List[float]]:
     """
     Main training loop for multi-file streaming dataset.
 
-    Trains on multiple files in sequence, where each file = 1 epoch.
-    Automatically cycles through files and checkpoints after each.
+    Training terminology:
+    - 1 EPOCH = Sweep through ALL files in the data folder
+    - 1 ITERATION = Process 1 file
+
+    Automatically cycles through files and checkpoints after each epoch.
 
     Args:
         model: The LocalGeometryGCN model
@@ -426,15 +419,17 @@ def train_multi_file(
             - validate_every: Validate every N epochs (default: 1)
         checkpoint_callback: Function(epoch, model, optimizer, metrics) for saving
         metrics_logger: MetricsLogger for logging (optional)
+        start_iteration: Global iteration to start from (default: 0, for resuming training)
+                        Automatically calculates the correct epoch and file to resume from
 
     Returns:
         history: Dictionary with lists of training/validation metrics
 
-    File Cycling Strategy:
-        1. Load file 1 → train epoch 1 → checkpoint → switch to file 2
-        2. Load file 2 → train epoch 2 → checkpoint → switch to file 3
-        3. ... repeat until all files processed (1 full cycle)
-        4. Repeat cycle for num_epochs passes
+    Training Strategy:
+        1. Load file 1 → train iteration 1 → switch to file 2
+        2. Load file 2 → train iteration 2 → switch to file 3
+        3. ... repeat until all files processed (1 full epoch) → checkpoint
+        4. Repeat for num_epochs
 
     Example:
         >>> history = train_multi_file(
@@ -446,8 +441,8 @@ def train_multi_file(
     print("Starting Multi-File Training")
     print(f"{'='*60}")
     print(f"Total files: {len(train_dataset.file_paths)}")
-    print(f"Epochs per cycle: {len(train_dataset.file_paths)}")
-    print(f"Total cycles: {config['training']['num_epochs']}")
+    print(f"Iterations per epoch: {len(train_dataset.file_paths)}")
+    print(f"Total epochs: {config['training']['num_epochs']}")
     print(f"Batch size: {config['data']['batch_size']}")
     print(f"Device: {device}")
     print(f"{'='*60}\n")
@@ -473,43 +468,76 @@ def train_multi_file(
     num_workers = config['data'].get('num_workers', 4)
     prefetch_factor = config['data'].get('prefetch_factor', 2) if num_workers > 0 else None
 
-    # File cycling
+    # Training setup: 1 epoch = sweep through all files, 1 iteration = 1 file
     total_files = len(train_dataset.file_paths)
-    global_epoch = 0
+    num_epochs = config['training']['num_epochs']
+    total_iterations = num_epochs * total_files
 
-    # Validation ID tracking (built incrementally during first cycle)
+    # Calculate starting epoch and iteration from start_iteration
+    start_epoch = start_iteration // total_files
+    start_file_idx = start_iteration % total_files
+
+    if start_iteration > 0:
+        print(f"\n{'='*60}")
+        print(f"Resuming from iteration {start_iteration}/{total_iterations}")
+        print(f"Starting at epoch {start_epoch + 1}/{num_epochs}, file {start_file_idx + 1}/{total_files}")
+        print(f"{'='*60}\n")
+
+    # Validation ID tracking (built incrementally during first epoch)
     validation_info_list = []
     export_validation_ids = config['logging'].get('export_validation_ids', False)
 
-    for cycle in range(config['training']['num_epochs']):
+    for epoch in range(start_epoch, num_epochs):
         print(f"\n{'='*60}")
-        print(f"Cycle {cycle + 1}/{config['training']['num_epochs']}")
+        print(f"Epoch {epoch + 1}/{num_epochs} (Sweeping all {total_files} files)")
         print(f"{'='*60}")
 
-        # Iterate through all files
-        for file_idx in range(total_files):
-            global_epoch += 1
+        # Determine starting iteration for this epoch
+        iteration_start = start_file_idx if epoch == start_epoch else 0
+
+        # Iterate through all files (1 file = 1 iteration)
+        for iteration in range(iteration_start, total_files):
+            print(f"\n[Epoch {epoch + 1}, Iteration {iteration + 1}/{total_files}]")
 
             # Switch to next file
-            if file_idx > 0:  # Skip first file (already loaded)
-                print(f"\nSwitching to file {file_idx + 1}/{total_files}...")
+            # Skip file switching on very first iteration (file already loaded at index 0)
+            # OR if we're resuming from start_iteration (files already positioned correctly)
+            should_switch = iteration > 0 and not (epoch == start_epoch and iteration == iteration_start and start_iteration > 0)
+
+            if should_switch:
+                print(f"Switching to file {iteration + 1}/{total_files}...")
                 train_dataset.next_file()
 
                 # Conditionally switch validation dataset
                 use_fixed_validation = config['data'].get('use_fixed_validation', False)
                 if not use_fixed_validation:
-                    # Cycle validation dataset (validation molecules change each epoch)
+                    # Cycle validation dataset (validation molecules change each iteration)
                     val_dataset.next_file()
                 else:
-                    # Keep validation dataset fixed (same molecules every epoch)
+                    # Keep validation dataset fixed (same molecules every iteration)
                     print(f"  Validation stays on: {val_dataset.file_paths[val_dataset.current_file_idx]}")
+            elif start_iteration > 0 and epoch == start_epoch and iteration == iteration_start:
+                # When resuming, we need to manually set the dataset to the correct file
+                print(f"Resuming at file {iteration + 1}/{total_files}...")
+                # Clear cache and set to correct file index
+                train_dataset.chunk_cache.clear()
+                train_dataset.current_file_idx = iteration
+                train_dataset.current_file = train_dataset.file_paths[iteration]
+                train_dataset._load_file_metadata()
 
-            # Track validation info during first cycle
-            if cycle == 0 and export_validation_ids:
+                use_fixed_validation = config['data'].get('use_fixed_validation', False)
+                if not use_fixed_validation:
+                    val_dataset.chunk_cache.clear()
+                    val_dataset.current_file_idx = iteration
+                    val_dataset.current_file = val_dataset.file_paths[iteration]
+                    val_dataset._load_file_metadata()
+
+            # Track validation info during first epoch
+            if epoch == 0 and export_validation_ids:
                 val_info = _get_validation_info_for_current_file(
                     train_dataset,
                     val_dataset,
-                    file_idx,
+                    iteration,
                     config
                 )
                 validation_info_list.append(val_info)
@@ -536,17 +564,21 @@ def train_multi_file(
                 persistent_workers=True if num_workers > 0 else False
             )
 
-            print(f"\nEpoch {global_epoch} - Training on file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
+            print(f"Training on file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
             print(f"Train dataset size: {len(train_dataset)} bonds")
             print(f"Val dataset size: {len(val_dataset)} bonds")
 
-            # Train one epoch
+            # Train one iteration
             start_time = time.time()
             train_metrics = train_epoch(
                 model, train_loader, optimizer, device, config,
-                global_epoch, file_idx, total_files
+                epoch, iteration, total_files
             )
             train_time = time.time() - start_time
+
+            # Calculate global epoch (for logging and display)
+            global_iteration = epoch * total_files + iteration + 1  # +1 for 1-indexed
+            global_epoch = epoch + 1  # 1-indexed for display
 
             # Log training metrics
             history['train_loss'].append(train_metrics['total_loss'])
@@ -564,6 +596,9 @@ def train_multi_file(
             print(f"  Distance Loss: {train_metrics['distance_loss']:.6f}")
             print(f"  Geometry Loss: {train_metrics['geometry_loss']:.6f}")
             print(f"  Learning Rate: {current_lr:.6f}")
+
+            # Initialize val_metrics to None (will be set if validation runs)
+            val_metrics = None
 
             # Validation
             if global_epoch % validate_every == 0:
@@ -614,16 +649,26 @@ def train_multi_file(
                     print(f"{'='*60}")
                     return history
 
-            # Checkpoint after each file
-            if checkpoint_callback is not None:
+            # Checkpoint every N iterations (and always save the last iteration)
+            save_every_n = config['checkpointing'].get('save_every_n_iterations', 1)
+            is_last_iteration = (epoch == num_epochs - 1) and (iteration == total_files - 1)
+            should_save = (global_iteration % save_every_n == 0) or is_last_iteration
+
+            if checkpoint_callback is not None and should_save:
+                if is_last_iteration:
+                    print(f"\n[Checkpoint] Saving final iteration {iteration + 1}/{total_files}, epoch {epoch + 1}")
+                else:
+                    print(f"\n[Checkpoint] Saving at iteration {iteration + 1}/{total_files}, epoch {epoch + 1}")
                 checkpoint_callback(
-                    epoch=global_epoch,
+                    epoch=epoch,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     metrics={
+                        'iteration': iteration,
+                        'global_iteration': global_iteration,
                         'train_loss': train_metrics['total_loss'],
-                        'val_loss': val_metrics['total_loss'] if 'val_loss' in history and len(history['val_loss']) > 0 else None,
+                        'val_loss': val_metrics['total_loss'] if val_metrics is not None else None,
                         'best_val_loss': best_val_loss
                     }
                 )
@@ -631,20 +676,21 @@ def train_multi_file(
             # Log to metrics logger
             if metrics_logger is not None:
                 metrics_logger.log(
-                    epoch=global_epoch,
+                    iteration=global_iteration,
                     train_loss=train_metrics['total_loss'],
-                    val_loss=val_metrics['total_loss'] if global_epoch % validate_every == 0 else None,
+                    val_loss=val_metrics['total_loss'] if val_metrics is not None else None,
                     metrics={
                         'train_distance_loss': train_metrics['distance_loss'],
                         'train_geometry_loss': train_metrics['geometry_loss'],
-                        'val_distance_loss': val_metrics.get('distance_loss'),
-                        'val_geometry_loss': val_metrics.get('geometry_loss'),
+                        'val_distance_loss': val_metrics.get('distance_loss') if val_metrics is not None else None,
+                        'val_geometry_loss': val_metrics.get('geometry_loss') if val_metrics is not None else None,
                     },
-                    lr=current_lr
+                    lr=current_lr,
+                    epoch=global_epoch
                 )
 
-        # End of file loop - save validation IDs after first cycle
-        if cycle == 0 and export_validation_ids and len(validation_info_list) > 0:
+        # End of iteration loop - save validation IDs after first epoch
+        if epoch == 0 and export_validation_ids and len(validation_info_list) > 0:
             _save_validation_ids(validation_info_list, config)
 
     print(f"\n{'='*60}")

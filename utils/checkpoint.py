@@ -46,10 +46,11 @@ def save_checkpoint(
         model: The model to save
         optimizer: Optimizer state
         scheduler: Learning rate scheduler (optional)
-        metrics: Dictionary with current metrics (train_loss, val_loss, etc.)
-        config: Configuration dictionary
+        metrics: Dictionary with current metrics (train_loss, val_loss, global_iteration, etc.)
+                 If 'global_iteration' is in metrics, it will be used for naming
+        config: Configuration dictionary (must include checkpointing.keep_last_n for cleanup)
         checkpoint_dir: Directory to save checkpoints
-        filename: Custom filename (default: checkpoint_epoch_{epoch}.pt)
+        filename: Custom filename (default: checkpoint_iter_{iteration}.pt or checkpoint_epoch_{epoch}.pt)
         save_best: If True, also save as 'best_model.pt'
         history: Training history dict (optional)
 
@@ -59,9 +60,12 @@ def save_checkpoint(
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Default filename
+    # Default filename - use global_iteration if available in metrics
     if filename is None:
-        filename = f"checkpoint_epoch_{epoch:04d}.pt"
+        if 'global_iteration' in metrics:
+            filename = f"checkpoint_iter_{metrics['global_iteration']:06d}.pt"
+        else:
+            filename = f"checkpoint_epoch_{epoch:04d}.pt"
 
     checkpoint_path = os.path.join(checkpoint_dir, filename)
 
@@ -93,6 +97,11 @@ def save_checkpoint(
         best_path = os.path.join(checkpoint_dir, "best_model.pt")
         torch.save(checkpoint, best_path)
         print(f"Best model saved: {best_path}")
+
+    # Cleanup old checkpoints if keep_last_n is configured
+    keep_last_n = config.get('checkpointing', {}).get('keep_last_n', None)
+    if keep_last_n is not None:
+        cleanup_old_checkpoints(checkpoint_dir, keep_last_n=keep_last_n, keep_best=True)
 
     return checkpoint_path
 
@@ -244,7 +253,7 @@ def cleanup_old_checkpoints(
     # Get all checkpoint files
     checkpoint_files = [
         f for f in os.listdir(checkpoint_dir)
-        if f.startswith('checkpoint_epoch_') and f.endswith('.pt')
+        if f.startswith('checkpoint_') and f.endswith('.pt')
     ]
 
     # Sort by epoch number
@@ -278,7 +287,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     # Get all checkpoint files
     checkpoint_files = [
         f for f in os.listdir(checkpoint_dir)
-        if f.startswith('checkpoint_epoch_') and f.endswith('.pt')
+        if f.startswith('checkpoint_') and f.endswith('.pt')
     ]
 
     if not checkpoint_files:

@@ -139,55 +139,50 @@ def geometry_loss(
     reduction: str = 'mean'
 ) -> torch.Tensor:
     """
-    Compute combined loss for (r, θ, φ) geometry with proper handling of each component.
+    Compute combined loss for (θ, Δφ) angular geometry with proper handling of each component.
     Always uses averaging over valid elements.
 
     Args:
-        pred_geom: (batch_size, max_bonds, 3) predicted (r, θ, φ) [θ, φ in degrees]
-        target_geom: (batch_size, max_bonds, 3) target (r, θ, φ) [θ, φ in degrees]
+        pred_geom: (batch_size, max_bonds, 2) predicted (θ, Δφ) [θ, Δφ in degrees]
+        target_geom: (batch_size, max_bonds, 2) target (θ, Δφ) [θ, Δφ in degrees]
         mask: (batch_size, max_bonds) mask for valid bonds (1 = valid, 0 = padding)
-        weights: Optional dict with keys 'r', 'theta', 'phi' for component weights
-                 Default: {'r': 1.0, 'theta': 1.0, 'phi': 1.0} - all equal
+        weights: Optional dict with keys 'theta', 'phi' for component weights
+                 Default: {'theta': 1.0, 'phi': 1.0} - all equal
         reduction: 'mean' or 'none' (default: 'mean')
 
     Returns:
         loss: Mean combined geometry loss
 
     Note:
-        - r: Uses percentage loss (scale-invariant)
         - θ: Normalized by 180° (so 90° error = 0.5 loss, θ range is [0, 180])
-        - φ: Normalized by 360° with circular wraparound (so 36° error = 0.1 loss)
+        - Δφ: Normalized by 360° (so 36° error = 0.1 loss, Δφ range is [0, 360])
+              Represents relative azimuthal differences (no circular wraparound needed)
     """
     if weights is None:
-        weights = {'r': 1.0, 'theta': 1.0, 'phi': 1.0}
+        weights = {'theta': 1.0, 'phi': 1.0}
 
     # Extract components
-    pred_r = pred_geom[:, :, 0]  # (batch_size, max_bonds)
-    pred_theta = pred_geom[:, :, 1]
-    pred_phi = pred_geom[:, :, 2]
+    pred_theta = pred_geom[:, :, 0]  # (batch_size, max_bonds)
+    pred_delta_phi = pred_geom[:, :, 1]
 
-    target_r = target_geom[:, :, 0]
-    target_theta = target_geom[:, :, 1]
-    target_phi = target_geom[:, :, 2]
-
-    # Loss for r (distance) - percentage loss
-    loss_r = percentage_loss(pred_r, target_r, epsilon=1e-3, reduction='none')
-    loss_r = loss_r * mask  # Apply mask
+    target_theta = target_geom[:, :, 0]
+    target_delta_phi = target_geom[:, :, 1]
 
     # Loss for θ (polar angle) - normalized by 180 degrees (θ range is [0, 180])
     theta_diff = torch.abs(pred_theta - target_theta)
     loss_theta = (theta_diff / 180.0) * mask  # Normalize by 180°
 
-    # Loss for φ (azimuthal angle) - circular loss normalized by 360°
-    loss_phi = circular_angle_loss(pred_phi, target_phi, mask=mask, period=360.0, reduction='none')
+    # Loss for Δφ (relative azimuthal difference) - normalized by 360°
+    # No circular wraparound needed since these are differences, not absolute angles
+    delta_phi_diff = torch.abs(pred_delta_phi - target_delta_phi)
+    loss_delta_phi = (delta_phi_diff / 360.0) * mask  # Normalize by 360°
 
-    # Combine with weights and AVERAGE (not sum) the three components
+    # Combine with weights and AVERAGE (not sum) the two components
     # This ensures the geometry loss stays in a reasonable [0, ~1] range
-    num_components = sum(weights.values())  # Typically 3.0 if all weights are 1.0
+    num_components = sum(weights.values())  # Typically 2.0 if all weights are 1.0
     total_loss = (
-        weights['r'] * loss_r +
         weights['theta'] * loss_theta +
-        weights['phi'] * loss_phi
+        weights['phi'] * loss_delta_phi
     ) / num_components  # Average across components
 
     # Average over valid elements
@@ -212,15 +207,14 @@ def total_loss(
 
     Args:
         pred_dist: (batch_size, 1) predicted A-B distances
-        pred_geom_a: (batch_size, max_bonds, 3) predicted geometry for A's neighbors
-        pred_geom_b: (batch_size, max_bonds, 3) predicted geometry for B's neighbors
+        pred_geom_a: (batch_size, max_bonds, 2) predicted (θ, Δφ) for A's neighbors
+        pred_geom_b: (batch_size, max_bonds, 2) predicted (θ, Δφ) for B's neighbors
         data: PyG Data batch containing target values and masks
         config: Optional dict with loss weights. Default:
                 {
                     'loss': {
                         'distance_weight': 1.0,
                         'geometry_weight': 1.0,
-                        'r_weight': 1.0,
                         'theta_weight': 1.0,
                         'phi_weight': 1.0
                     }
@@ -243,7 +237,6 @@ def total_loss(
             'loss': {
                 'distance_weight': 1.0,
                 'geometry_weight': 1.0,
-                'r_weight': 1.0,
                 'theta_weight': 1.0,
                 'phi_weight': 1.0
             }
@@ -251,7 +244,6 @@ def total_loss(
 
     # Geometry component weights - all equal
     geom_weights = {
-        'r': config['loss'].get('r_weight', 1.0),
         'theta': config['loss'].get('theta_weight', 1.0),
         'phi': config['loss'].get('phi_weight', 1.0)
     }
@@ -263,7 +255,7 @@ def total_loss(
     # Geometry loss for node A
     batch_size = pred_geom_a.size(0)
     mask_a = data.bond_mask_a.view(batch_size, -1)
-    target_geom_a = data.target_geometry_a.view(batch_size, -1, 3)
+    target_geom_a = data.target_geometry_a.view(batch_size, -1, 2)
 
     loss_geom_a = geometry_loss(
         pred_geom_a,
@@ -275,7 +267,7 @@ def total_loss(
 
     # Geometry loss for node B
     mask_b = data.bond_mask_b.view(batch_size, -1)
-    target_geom_b = data.target_geometry_b.view(batch_size, -1, 3)
+    target_geom_b = data.target_geometry_b.view(batch_size, -1, 2)
 
     loss_geom_b = geometry_loss(
         pred_geom_b,

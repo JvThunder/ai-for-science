@@ -36,12 +36,16 @@ data:
   # Recommend: 2048-8192 MB depending on available RAM
   cache_ram_mb: 2048
 
-  # Minimum element occurrences for vocabulary
-  min_element_count: 10
+  # Element vocabulary file (txt format, one element per line)
+  # If not present, will be created by scanning data files
+  elements_txt: "elements.txt"
+
+  # Maximum molecules to scan when creating vocabulary (for speed)
+  max_molecules_for_vocab: 100000
 
 # Model Architecture
 model:
-  # Hidden dimension for GCN layers
+  # Hidden dimension for GAT layers
   hidden_dim: 32
 
   # Element embedding dimension
@@ -53,14 +57,32 @@ model:
   # Maximum bonds (should match data.max_bonds)
   max_bonds: 7
 
-  # Depth: Number of GCN layers (graph distance from bond being evaluated)
-  # depth=1: 1 GCN layer, depth=2: 2 layers, depth=3: 3 layers, etc.
+  # Depth: Number of GAT layers (graph distance from bond being evaluated)
+  # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
   depth: 1
+
+  # Bond type features: Enable edge features for bond types
+  # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
+  use_bond_types: true
+
+  # Number of bond types (default: 4 for single, aromatic, double, triple)
+  num_bond_types: 4
+
+  # Bond type embedding dimension
+  bond_embedding_dim: 8
 
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 2
+  num_epochs: 5
+
+  # Resume from checkpoint (set to null or path to checkpoint file)
+  # Example: "checkpoints/best_model.pt"
+  resume_checkpoint: null
+
+  # Automatically resume from latest checkpoint (overrides resume_checkpoint if true)
+  # Searches for the most recent checkpoint in checkpoint_dir
+  resume_from_latest: false
 
   # Learning rate
   learning_rate: 0.0001
@@ -88,27 +110,27 @@ training:
 
 # Loss Function Weights
 loss:
-  # Weight for distance prediction loss
+  # Weight for distance prediction loss (A-B bond distance)
   distance_weight: 1.0
 
-  # Weight for geometry (r, θ, φ) prediction loss
+  # Weight for angular geometry (θ, Δφ) prediction loss
   geometry_weight: 1.0
 
-  # Individual geometry component weights (all percentage-based and equal)
-  r_weight: 1.0         # Distance to neighbors
-  theta_weight: 1.0     # Polar angle (degrees)
-  phi_weight: 1.0       # Azimuthal angle (degrees)
+  # Individual angular geometry component weights (all normalized and equal)
+  theta_weight: 1.0     # Polar angle (degrees) [0, 180°]
+  phi_weight: 1.0       # Relative azimuthal difference (degrees) [0, 360°]
 
 # Checkpointing
 checkpointing:
   # Directory to save checkpoints
   checkpoint_dir: "checkpoints"
 
-  # Save checkpoint every N epochs
-  save_every: 1
+  # Save checkpoint every N iterations (1 iteration = 1 file)
+  # Set to 1 to save after every file, 2 to save every 2 files, etc.
+  save_every_n_iterations: 2
 
   # Keep only N most recent checkpoints
-  keep_last_n: 1
+  keep_last_n: 3
 
 # Logging
 logging:

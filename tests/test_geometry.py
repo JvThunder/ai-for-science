@@ -2,7 +2,7 @@
 Unit tests for geometry utilities.
 
 Tests the core stereochemistry-aware geometry functions including
-local coordinate frame construction and cylindrical coordinate computation.
+local coordinate frame construction and Spherical coordinate computation.
 """
 
 import pytest

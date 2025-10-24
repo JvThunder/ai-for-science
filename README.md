@@ -1,6 +1,6 @@
 # Stereochemistry-Aware 3D Reconstruction GCN
 
-A Graph Convolutional Network for predicting local molecular geometry using cylindrical coordinates (r, θ, φ), enabling stereochemically-aware 3D structure reconstruction from learned representations.
+A Graph Convolutional Network for predicting local molecular geometry using Spherical coordinates (r, θ, φ), enabling stereochemically-aware 3D structure reconstruction from learned representations.
 
 ##  Key Features
 
@@ -505,7 +505,7 @@ python local_geometry_gcn_stereo.py --batch-size 64 --lr 0.001 --epochs 100
 python local_geometry_gcn_stereo.py --resume checkpoints/best_model.pt
 
 # Combine options
-python local_geometry_gcn_stereo.py --config my_config.yaml --batch-size 128 --resume checkpoints/checkpoint_epoch_0050.pt
+python local_geometry_gcn_stereo.py --config my_config.yaml --batch-size 128 --resume checkpoints/checkpoint_0050.pt
 ```
 
 ##  Configuration File (`config.yaml`)

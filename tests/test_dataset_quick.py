@@ -5,16 +5,23 @@ Quick test for MultiFileStreamingDataset with real data.
 import sys
 sys.path.append('utils')
 
-from dataset import MultiFileStreamingDataset, analyze_element_frequencies
+from dataset import MultiFileStreamingDataset, get_element_vocab
+import glob
 
 print("Testing MultiFileStreamingDataset...")
 print("=" * 60)
 
-# Step 1: Analyze element frequencies
-print("\n1. Analyzing element frequencies...")
-element_to_idx, freq_elem, rare_elem = analyze_element_frequencies(
-    file_pattern="../Compound_*.csv",
-    min_count=10,
+# Get file paths
+file_paths = sorted(glob.glob("../Compound_*.csv"))
+if not file_paths:
+    print("No CSV files found!")
+    sys.exit(1)
+
+# Step 1: Load element vocabulary
+print("\n1. Loading element vocabulary...")
+element_to_idx = get_element_vocab(
+    txt_path="../elements.txt",
+    file_paths=file_paths,
     max_molecules=1000  # Quick test with 1000 molecules
 )
 
@@ -24,11 +31,11 @@ print(f"Sample elements: {list(element_to_idx.keys())[:10]}")
 # Step 2: Create dataset
 print("\n2. Creating streaming dataset...")
 dataset = MultiFileStreamingDataset(
-    file_pattern="../Compound_*.csv",
+    file_paths=file_paths,
     element_to_idx=element_to_idx,
     current_file_idx=0,
     max_samples=100,  # Test with 100 samples
-    training_mode=True
+    training=True
 )
 
 print(f"\nDataset size: {len(dataset)} bonds")
@@ -67,7 +74,7 @@ print("\n4. Testing file cycling...")
 current_file = dataset.current_file
 print(f"  Before: {current_file}")
 
-if len(dataset.files) > 1:
+if len(dataset.file_paths) > 1:
     new_file = dataset.next_file()
     print(f"  After: {new_file}")
     print(f"  New dataset size: {len(dataset)} bonds")

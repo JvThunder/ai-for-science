@@ -20,7 +20,7 @@
 Implemented:
 1. `create_orthonormal_frame()` - Gram-Schmidt orthogonalization
 2. `compute_local_geometry()` - **CRITICAL**: (r, θ, φ) computation with neighbor ordering
-3. `spherical_to_cartesian()` - 3D reconstruction from cylindrical coords
+3. `spherical_to_cartesian()` - 3D reconstruction from Spherical coords
 4. `validate_geometry_consistency()` - Physical constraints validation
 5. `compute_dihedral_angle()` - Torsional angle calculation
 6. `rmsd()` - Reconstruction accuracy metric
@@ -196,7 +196,7 @@ python local_geometry_gcn_stereo.py --config config.yaml [--batch-size N] [--lr 
 
 ### 1. Stereochemistry-Aware Representation
 Unlike standard GCNs that predict absolute positions or simple angles, this model:
-- Uses **cylindrical coordinates** (r, θ, φ) in bond-centered frames
+- Uses **Spherical coordinates** (r, θ, φ) in bond-centered frames
 - Captures **stereoisomer** information through azimuthal angle φ ordering
 - Is **rotationally invariant** - same representation regardless of molecule orientation
 
@@ -356,7 +356,7 @@ Based on architecture and implementation:
 
 2. **Verify outputs**:
    - Check `logs/training_metrics.png`
-   - Inspect `checkpoints/checkpoint_epoch_0001.pt`
+   - Inspect `checkpoints/checkpoint_0001.pt`
    - Review console output
 
 3. **If successful, scale up**:

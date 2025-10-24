@@ -133,7 +133,7 @@
   - Output: (x_axis, y_axis, z_axis) orthonormal frame
 
 - [] `spherical_to_cartesian(r, theta, phi, coord_frame, center_pos)`
-  - Input: Cylindrical coords + frame + center position
+  - Input: Spherical coords + frame + center position
   - Output: Cartesian 3D position
 
 - [] `validate_geometry_consistency(geometry, tolerance)`
@@ -363,7 +363,7 @@
 - **[18:25-18:45]** Implemented `utils/geometry.py`:
   - `create_orthonormal_frame()` - Gram-Schmidt orthogonalization
   - `compute_local_geometry()` - Core (r, θ, φ) computation with neighbor ordering
-  - `spherical_to_cartesian()` - 3D reconstruction from cylindrical coords
+  - `spherical_to_cartesian()` - 3D reconstruction from Spherical coords
   - `validate_geometry_consistency()` - Physical constraints validation
   - `compute_dihedral_angle()` - Torsional angle calculation
   - `rmsd()` - Reconstruction accuracy metric

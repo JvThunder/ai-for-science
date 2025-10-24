@@ -1,7 +1,7 @@
 """
 Geometry utilities for stereochemistry-aware 3D reconstruction.
 
-This module provides functions for computing local cylindrical coordinates
+This module provides functions for computing local Spherical coordinates
 (r, θ, φ) in a bond-centered reference frame, enabling rotationally-invariant
 and stereochemically-aware molecular geometry representation.
 
@@ -59,7 +59,7 @@ def create_orthonormal_frame(bond_axis: torch.Tensor, epsilon: float = 1e-6) -> 
     x_axis = x_axis / x_norm  # normalize (local x-axis)
 
     # Complete the orthonormal basis
-    y_axis = torch.cross(bond_axis, x_axis)  # local y-axis
+    y_axis = torch.cross(bond_axis, x_axis, dim = -1)  # local y-axis
     # y_axis is automatically normalized since bond_axis and x_axis are orthonormal
 
     return x_axis, y_axis
@@ -74,14 +74,14 @@ def compute_local_geometry(
     augment_rotation: bool = False
 ) -> Tuple[List[int], List[Tuple[float, float, float]], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
-    Compute local cylindrical coordinates (r, θ, φ) for neighbors of center_idx,
+    Compute local Spherical coordinates (r, θ, φ) for neighbors of center_idx,
     using center→reference bond as the coordinate system axis.
 
     Returns neighbors ordered by azimuthal angle φ (clockwise when viewing down axis).
 
     This is the CORE function for stereochemistry-aware geometry representation.
     It computes a rotationally-invariant representation of local molecular geometry
-    by expressing neighbor positions in a bond-centered cylindrical coordinate system.
+    by expressing neighbor positions in a bond-centered Spherical coordinate system.
 
     Args:
         pos: (N, 3) tensor of atom positions
@@ -219,7 +219,7 @@ def spherical_to_cartesian(
     center_pos: torch.Tensor
 ) -> torch.Tensor:
     """
-    Convert cylindrical coordinates (r, θ, φ) to Cartesian position.
+    Convert Spherical coordinates (r, θ, φ) to Cartesian position.
 
     Useful for 3D reconstruction from predicted geometry.
 
@@ -379,3 +379,65 @@ def rmsd(positions_pred: torch.Tensor, positions_true: torch.Tensor) -> float:
     diff = positions_pred - positions_true
     squared_dist = torch.sum(diff ** 2, dim=1)
     return torch.sqrt(torch.mean(squared_dist)).item()
+
+
+def convert_to_relative_azimuthal(
+    geometry: np.ndarray,
+    mask: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Convert absolute azimuthal angles (φ) to relative differences (Δφ).
+
+    The first neighbor is set to Δφ=0 by definition (establishes reference frame).
+    Subsequent neighbors have Δφ = difference from previous neighbor's φ.
+
+    Args:
+        geometry: (max_bonds, 3) array with (r, θ, φ) or (max_bonds, 2) with (θ, φ)
+                  φ should be in degrees [0, 360]
+        mask: (max_bonds,) optional mask (1=valid, 0=padding)
+
+    Returns:
+        geometry_relative: Same shape as input, with φ replaced by Δφ
+                          - If input is (r, θ, φ): returns (r, θ, Δφ)
+                          - If input is (θ, φ): returns (θ, Δφ)
+
+    Example:
+        >>> geom = np.array([[1.5, 90, 45], [1.2, 120, 120], [1.8, 60, 200]])
+        >>> geom_rel = convert_to_relative_azimuthal(geom)
+        >>> # Returns: [[1.5, 90, 0], [1.2, 120, 75], [1.8, 60, 80]]
+        >>> #   Δφ₁=0, Δφ₂=120-45=75, Δφ₃=200-120=80
+    """
+    geometry_relative = geometry.copy()
+    n_components = geometry.shape[1]
+    phi_idx = n_components - 1  # φ is always the last component
+
+    # Find valid neighbors
+    if mask is not None:
+        valid_indices = np.where(mask > 0)[0]
+    else:
+        # Assume all non-zero rows are valid
+        valid_indices = np.where(np.any(geometry != 0, axis=1))[0]
+
+    if len(valid_indices) == 0:
+        return geometry_relative
+
+    # First valid neighbor: Δφ = 0 (by definition, sets reference frame)
+    geometry_relative[valid_indices[0], phi_idx] = 0.0
+
+    # Subsequent neighbors: Δφ = difference from previous neighbor
+    for i in range(1, len(valid_indices)):
+        curr_idx = valid_indices[i]
+        prev_idx = valid_indices[i-1]
+
+        phi_curr = geometry[curr_idx, phi_idx]
+        phi_prev = geometry[prev_idx, phi_idx]
+
+        # Compute difference
+        delta_phi = phi_curr - phi_prev
+
+        # Normalize to [0, 360) range
+        delta_phi = delta_phi % 360.0
+
+        geometry_relative[curr_idx, phi_idx] = delta_phi
+
+    return geometry_relative

@@ -7,9 +7,17 @@ This module provides a streaming dataset implementation that:
 - Uses file-based epochs (each file = 1 epoch)
 - Reads CSV in chunks for memory efficiency
 - Integrates with stereochemistry-aware geometry computation
+- Extracts bond types (single, aromatic, double, triple) as edge features
 
 Key Classes:
 - MultiFileStreamingDataset: Main streaming dataset for training
+
+Subgraph Extraction:
+    Uses dual extraction strategy (from both bond endpoints) + union to capture
+    local context for both cyclic and linear molecular structures. At depth=1:
+    - Cyclic structures (triangles, rings): Captures complete local cycles
+    - Linear chains: Captures 2-hop neighborhoods (context from both sides)
+    - Bond types: Preserved as edge_attr for all edges in subgraph
 """
 
 import pandas as pd
@@ -29,7 +37,7 @@ import psutil
 
 # Import our geometry utilities
 sys.path.append(os.path.dirname(__file__))
-from geometry import compute_local_geometry
+from geometry import compute_local_geometry, convert_to_relative_azimuthal
 
 
 def parse_xyz_string(xyz_string: str) -> Tuple[List[List[float]], List[str]]:
@@ -200,6 +208,14 @@ def dfs_subgraph(graph: Dict[int, List[int]], start_node: int, depth: int = 1) -
 
     Returns:
         Set of nodes in the subgraph
+
+    Note:
+        This function is used in conjunction with dual extraction (from both node_a and node_b)
+        and union operation to ensure sufficient context for both cyclic and linear structures.
+
+        Examples with depth=1:
+        - Triangle (C-C-O): When predicting C-C bond, union of neighborhoods captures all 3 nodes
+        - Linear chain (O-C-C-O): When predicting C-C bond, union captures 2 hops (4 nodes total)
     """
     visited = set()
     queue = deque([(start_node, 0)])  # (node, current_depth)
@@ -554,6 +570,38 @@ class MultiFileStreamingDataset(Dataset):
 
         Returns:
             PyTorch Geometric Data object with local geometry
+
+        Subgraph Extraction Strategy:
+            The function extracts local subgraphs around both target atoms (A and B) and takes
+            their union to ensure sufficient context for geometry prediction.
+
+            With depth=1 (default), this approach handles different topologies correctly:
+
+            Case 1 - Cyclic structures (e.g., triangle C-C-O):
+                    C(0)
+                   /    \\
+                  C(1)--O(2)
+
+                When predicting C(0)-C(1) bond:
+                - subgraph_a from C(0): {C(0), C(1), O(2)}
+                - subgraph_b from C(1): {C(1), C(0), O(2)}
+                - Union: {C(0), C(1), O(2)} - captures entire triangle
+                - All edges preserved with bond types: C-C, C-O, O-C
+
+            Case 2 - Linear chains (e.g., O-C-C-O):
+                O(0)--C(1)--C(2)--O(3)
+
+                When predicting C(1)-C(2) bond:
+                - subgraph_a from C(1): {C(1), O(0), C(2)}
+                - subgraph_b from C(2): {C(2), C(1), O(3)}
+                - Union: {O(0), C(1), C(2), O(3)} - captures 2-hop neighborhood
+                - All edges preserved with bond types: O-C, C-C, C-O
+
+            The dual extraction + union strategy ensures that:
+            1. Cyclic structures: All atoms in local cycles are captured
+            2. Linear structures: Context from both sides of the bond is included
+            3. Bond types: Preserved via edge_attr for all edges in subgraph
+            4. Scalability: Memory-efficient for large molecules (only local context extracted)
         """
         # Parse XYZ and bonds
         coordinates, elements = parse_xyz_string(row['geometry_xyz'])
@@ -574,8 +622,10 @@ class MultiFileStreamingDataset(Dataset):
         pos = torch.tensor(coordinates, dtype=torch.float)
 
         # Create adjacency graph from dataset bonds
+        # Also track bond types: 0=single, 1=aromatic, 2=double, 3=triple
         adjacency = defaultdict(list)
         bond_pairs = []
+        bond_types_dict = {}  # (i, j) -> bond_type
 
         # Add bonds from dataset
         for bond in bonds_data:
@@ -586,6 +636,23 @@ class MultiFileStreamingDataset(Dataset):
                     adjacency[j].append(i)
                     dist = torch.norm(pos[i] - pos[j])
                     bond_pairs.append((i, j, dist.item()))
+
+                    # Extract bond type from order
+                    bond_order = bond.get('order', 1.0)
+                    if bond_order == 1.0:
+                        bond_type = 0  # Single bond
+                    elif bond_order == 1.5:
+                        bond_type = 1  # Aromatic bond
+                    elif bond_order == 2.0:
+                        bond_type = 2  # Double bond
+                    elif bond_order == 3.0:
+                        bond_type = 3  # Triple bond
+                    else:
+                        bond_type = 0  # Default to single for unknown orders
+
+                    # Store bond type for both directions
+                    bond_types_dict[(i, j)] = bond_type
+                    bond_types_dict[(j, i)] = bond_type
 
         # Add non-bonded pairs if requested
         if self.include_non_bonded:
@@ -629,8 +696,9 @@ class MultiFileStreamingDataset(Dataset):
         subgraph_x = x[node_list]
         subgraph_pos = pos[node_list]
 
-        # Create subgraph edges
+        # Create subgraph edges with bond type attributes
         edge_index = []
+        edge_attr = []  # Bond type for each edge
         for old_i in node_list:
             for old_j in adjacency[old_i]:
                 if old_j in node_mapping:
@@ -638,7 +706,12 @@ class MultiFileStreamingDataset(Dataset):
                     new_j = node_mapping[old_j]
                     edge_index.append([new_i, new_j])
 
+                    # Get bond type (default to 0 if not found - for non-bonded pairs)
+                    bond_type = bond_types_dict.get((old_i, old_j), 0)
+                    edge_attr.append(bond_type)
+
         edge_index = torch.tensor(edge_index, dtype=torch.long).t() if edge_index else torch.empty((2, 0), dtype=torch.long)
+        edge_attr = torch.tensor(edge_attr, dtype=torch.long) if edge_attr else torch.empty((0,), dtype=torch.long)
 
         # **NEW: Compute stereochemistry-aware local geometry**
         # For node A, use A→B bond as reference
@@ -677,49 +750,70 @@ class MultiFileStreamingDataset(Dataset):
             geometry_b = []
             frame_b = None
 
-        # Pack geometry into tensors (r, θ, φ) for up to max_bonds
-        # NOTE: convert angles from radians to degrees for model/loss compatibility
-        geometry_a_padded = []
-        for i in range(self.max_bonds):
-            if i < len(geometry_a):
-                r, theta, phi = geometry_a[i]
-                # Convert angles from radians to degrees
-                theta_deg = math.degrees(theta)
-                phi_deg = math.degrees(phi)
-                geometry_a_padded.append([r, theta_deg, phi_deg])
-            else:
-                geometry_a_padded.append([0.0, 0.0, 0.0])  # Padding
-
-        geometry_b_padded = []
-        for i in range(self.max_bonds):
-            if i < len(geometry_b):
-                r, theta, phi = geometry_b[i]
-                # Convert angles from radians to degrees
-                theta_deg = math.degrees(theta)
-                phi_deg = math.degrees(phi)
-                geometry_b_padded.append([r, theta_deg, phi_deg])
-            else:
-                geometry_b_padded.append([0.0, 0.0, 0.0])  # Padding
-
-        # Bond masks
-        bond_mask_a = torch.zeros(self.max_bonds)
+        # Create bond masks first (needed for relative azimuthal conversion)
+        bond_mask_a = np.zeros(self.max_bonds)
         for i in range(min(len(geometry_a), self.max_bonds)):
             bond_mask_a[i] = 1.0
 
-        bond_mask_b = torch.zeros(self.max_bonds)
+        bond_mask_b = np.zeros(self.max_bonds)
         for i in range(min(len(geometry_b), self.max_bonds)):
             bond_mask_b[i] = 1.0
+
+        # Pack geometry into tensors (θ, Δφ) for up to max_bonds
+        # NOTE: convert angles from radians to degrees for model/loss compatibility
+        # NOTE: Convert absolute φ to relative Δφ (first neighbor Δφ=0)
+
+        # Process geometry_a: convert to (r, θ°, φ°) first
+        geometry_a_deg = []
+        for i in range(self.max_bonds):
+            if i < len(geometry_a):
+                r, theta, phi = geometry_a[i]
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                geometry_a_deg.append([r, theta_deg, phi_deg])
+            else:
+                geometry_a_deg.append([0.0, 0.0, 0.0])  # Padding
+
+        # Convert to numpy for processing
+        geometry_a_np = np.array(geometry_a_deg)
+        # Convert (r, θ, φ) to (r, θ, Δφ) using relative azimuthal
+        geometry_a_relative = convert_to_relative_azimuthal(geometry_a_np, bond_mask_a)
+        # Extract only (θ, Δφ) - discard r
+        geometry_a_padded = geometry_a_relative[:, 1:].tolist()  # Shape: (max_bonds, 2)
+
+        # Process geometry_b similarly
+        geometry_b_deg = []
+        for i in range(self.max_bonds):
+            if i < len(geometry_b):
+                r, theta, phi = geometry_b[i]
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                geometry_b_deg.append([r, theta_deg, phi_deg])
+            else:
+                geometry_b_deg.append([0.0, 0.0, 0.0])  # Padding
+
+        # Convert to numpy for processing
+        geometry_b_np = np.array(geometry_b_deg)
+        # Convert (r, θ, φ) to (r, θ, Δφ) using relative azimuthal
+        geometry_b_relative = convert_to_relative_azimuthal(geometry_b_np, bond_mask_b)
+        # Extract only (θ, Δφ) - discard r
+        geometry_b_padded = geometry_b_relative[:, 1:].tolist()  # Shape: (max_bonds, 2)
+
+        # Convert masks to tensors
+        bond_mask_a = torch.tensor(bond_mask_a, dtype=torch.float)
+        bond_mask_b = torch.tensor(bond_mask_b, dtype=torch.float)
 
         # Create data object
         data = Data(
             x=subgraph_x,
             edge_index=edge_index,
+            edge_attr=edge_attr,  # Bond type: 0=single, 1=aromatic, 2=double, 3=triple
             pos=subgraph_pos,
             node_a=new_node_a,
             node_b=new_node_b,
             target_distance=torch.tensor([target_distance], dtype=torch.float),
-            target_geometry_a=torch.tensor(geometry_a_padded, dtype=torch.float),  # (max_bonds, 3): (r, θ°, φ°)
-            target_geometry_b=torch.tensor(geometry_b_padded, dtype=torch.float),  # (max_bonds, 3): (r, θ°, φ°)
+            target_geometry_a=torch.tensor(geometry_a_padded, dtype=torch.float),  # (max_bonds, 2): (θ°, Δφ°)
+            target_geometry_b=torch.tensor(geometry_b_padded, dtype=torch.float),  # (max_bonds, 2): (θ°, Δφ°)
             bond_mask_a=bond_mask_a,
             bond_mask_b=bond_mask_b
         )
@@ -727,33 +821,70 @@ class MultiFileStreamingDataset(Dataset):
         return data
 
 
-def analyze_element_frequencies(
+def load_elements_from_txt(txt_path: str) -> Dict[str, int]:
+    """
+    Load element vocabulary from a text file.
+
+    Each line in the file should contain one element symbol.
+    Index 0 is implicitly reserved for 'OTHER' (unknown elements).
+    Elements from file start at index 1.
+
+    Args:
+        txt_path: Path to text file containing element symbols (one per line)
+
+    Returns:
+        element_to_idx: Mapping from element to index (0 = 'OTHER', 1+ = known elements)
+
+    Example txt file:
+        H
+        C
+        N
+        O
+    """
+    # Start with OTHER at index 0 (implicit)
+    element_to_idx = {'OTHER': 0}
+
+    with open(txt_path, 'r') as f:
+        for line in f:
+            element = line.strip()
+            if element and element != 'OTHER':  # Skip empty lines and explicit OTHER
+                # Add element starting from index 1
+                if element not in element_to_idx:
+                    element_to_idx[element] = len(element_to_idx)
+
+    print(f"Loaded {len(element_to_idx)} elements from {txt_path} (including implicit OTHER)")
+    print(f"  Known elements: {sorted([e for e in element_to_idx.keys() if e != 'OTHER'])}")
+
+    return element_to_idx
+
+
+def create_elements_txt_from_data(
     file_paths: List[str],
-    min_count: int = 10,
+    output_path: str = "elements.txt",
     max_molecules: int = 100000
 ) -> Dict[str, int]:
     """
-    Analyze element frequencies across dataset files.
+    Scan dataset files to extract unique elements and create elements.txt file.
 
     Reads files in chunks and stops after max_molecules for efficiency.
 
     Args:
-        file_paths: List of CSV file paths
-        min_count: Minimum occurrences for frequent elements
-        max_molecules: Maximum molecules to analyze (for speed)
+        file_paths: List of CSV file paths to scan
+        output_path: Path to save elements.txt (default: "elements.txt")
+        max_molecules: Maximum molecules to scan (for speed)
 
     Returns:
         element_to_idx: Mapping from element to index (0 = 'OTHER')
     """
-    element_counts = defaultdict(int)
+    unique_elements = set()
     files = file_paths if isinstance(file_paths, list) else [file_paths]
 
     if not files:
         raise ValueError(f"No files provided")
 
-    print(f"Analyzing element frequencies from {len(files)} file(s)...")
+    print(f"Scanning {len(files)} file(s) to extract unique elements...")
 
-    molecules_analyzed = 0
+    molecules_scanned = 0
 
     for file_path in files:
         print(f"  Reading: {file_path}")
@@ -769,37 +900,74 @@ def analyze_element_frequencies(
                         continue
 
                     for element in elements:
-                        element_counts[element] += 1
+                        unique_elements.add(element.strip())
 
-                    molecules_analyzed += 1
+                    molecules_scanned += 1
 
-                    if molecules_analyzed >= max_molecules:
+                    if molecules_scanned >= max_molecules:
                         break
 
                 except Exception:
                     continue
 
-            if molecules_analyzed >= max_molecules:
+            if molecules_scanned >= max_molecules:
                 break
 
-        if molecules_analyzed >= max_molecules:
+        if molecules_scanned >= max_molecules:
             break
 
-    # Filter by frequency
-    frequent_elements = {elem: count for elem, count in element_counts.items() if count >= min_count}
-    rare_elements = {elem: count for elem, count in element_counts.items() if count < min_count}
+    # Sort elements alphabetically for consistency
+    sorted_elements = sorted(unique_elements)
 
-    print(f"\nElement frequency analysis ({molecules_analyzed} molecules):")
-    print(f"  Unique elements: {len(element_counts)}")
-    print(f"  Frequent (>={min_count}): {len(frequent_elements)}")
-    print(f"  Rare (<{min_count}): {len(rare_elements)}")
+    # Write to file (no OTHER - it's implicit at index 0)
+    with open(output_path, 'w') as f:
+        for element in sorted_elements:
+            f.write(f"{element}\n")
 
-    # Create mapping (0 reserved for 'OTHER')
-    element_to_idx = {'OTHER': 0}
-    for i, element in enumerate(sorted(frequent_elements.keys())):
-        element_to_idx[element] = i + 1
+    print(f"\nCreated {output_path} with {len(sorted_elements)} elements (OTHER is implicit at index 0)")
+    print(f"  Scanned {molecules_scanned} molecules")
+    print(f"  Unique elements found: {sorted_elements}")
 
-    print(f"  Vocabulary size: {len(element_to_idx)} (including OTHER)")
-    print(f"  Frequent elements: {sorted(frequent_elements.keys())}")
+    # Return the mapping
+    return load_elements_from_txt(output_path)
 
-    return element_to_idx
+
+def get_element_vocab(
+    txt_path: str = "elements.txt",
+    file_paths: Optional[List[str]] = None,
+    max_molecules: int = 100000
+) -> Dict[str, int]:
+    """
+    Get element vocabulary, loading from txt file or creating it if needed.
+
+    Args:
+        txt_path: Path to elements.txt file
+        file_paths: List of CSV files to scan if txt doesn't exist
+        max_molecules: Max molecules to scan when creating txt
+
+    Returns:
+        element_to_idx: Mapping from element to index (0 = 'OTHER')
+
+    Usage:
+        # Try to load, create if missing
+        element_vocab = get_element_vocab(
+            txt_path="elements.txt",
+            file_paths=["data/file1.csv", "data/file2.csv"]
+        )
+
+        # Load only (error if missing)
+        element_vocab = get_element_vocab(txt_path="elements.txt")
+    """
+    if os.path.exists(txt_path):
+        print(f"Loading element vocabulary from {txt_path}")
+        return load_elements_from_txt(txt_path)
+    else:
+        if file_paths is None:
+            raise FileNotFoundError(
+                f"Element vocabulary file not found: {txt_path}\n"
+                f"Please provide file_paths to scan and create it."
+            )
+
+        print(f"Element vocabulary file not found: {txt_path}")
+        print(f"Creating it by scanning data files...")
+        return create_elements_txt_from_data(file_paths, txt_path, max_molecules)

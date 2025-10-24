@@ -3,25 +3,27 @@
 Stereochemistry-Aware 3D Reconstruction GCN - Main Training Script
 
 This script implements a Graph Convolutional Network for predicting local
-molecular geometry in cylindrical coordinates (r, θ, φ), enabling
+molecular geometry in Spherical coordinates (r, θ, φ), enabling
 stereochemically-aware 3D structure reconstruction from learned representations.
 
 Key Features:
 - Multi-file streaming: Train on TB-scale datasets without RAM caching
-- Cylindrical coordinates: Rotationally-invariant (r, θ, φ) representation
+- Spherical coordinates: Rotationally-invariant (r, θ, φ) representation
 - Stereochemistry-aware: Ordered neighbors with azimuthal angles
 - Percentage-based loss: Better scaling across distance ranges
-- File-based epochs: Each CSV file = 1 epoch, cycle through all files
+- Training scheme: 1 epoch = all files, 1 iteration = 1 file
 
 Usage:
-    # Train with default config
-    python local_geometry_gcn_stereo.py --config config.yaml
+    # Train with config.yaml (all settings configured in the file)
+    python local_geometry_gcn_stereo.py
 
-    # Resume from checkpoint
-    python local_geometry_gcn_stereo.py --config config.yaml --resume checkpoints/best_model.pt
+    # To resume from a specific checkpoint, set 'resume_checkpoint' in config.yaml:
+    # training:
+    #   resume_checkpoint: "checkpoints/best_model.pt"
 
-    # Override config parameters
-    python local_geometry_gcn_stereo.py --config config.yaml --batch-size 64 --lr 0.001
+    # To automatically resume from latest checkpoint, set 'resume_from_latest' in config.yaml:
+    # training:
+    #   resume_from_latest: true
 
 Author: Claude Code
 Date: 2025-10-13
@@ -30,7 +32,6 @@ Date: 2025-10-13
 import torch
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
-import argparse
 import os
 import random
 import numpy as np
@@ -48,12 +49,16 @@ except ImportError:
 # Import utilities
 from utils.config import load_config, validate_config, print_config, merge_configs
 from utils.model import LocalGeometryGCN, count_parameters, initialize_weights
-from utils.dataset import MultiFileStreamingDataset, analyze_element_frequencies
+from utils.dataset import MultiFileStreamingDataset, get_element_vocab
 from utils.training import train_multi_file
 from utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from utils.metrics import MetricsLogger
 import json
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message="UnsupportedFieldAttributeWarning")
 
 def set_random_seeds(seed: int = 42):
     """
@@ -127,11 +132,13 @@ def create_datasets(config):
     for f in train_files:
         print(f"  - {f.name}")
 
-    # Analyze element frequencies across all training files
-    print("\nAnalyzing element frequencies...")
-    element_to_idx = analyze_element_frequencies(
-        [str(f) for f in train_files],
-        min_count=config['data'].get('min_element_count', 10)
+    # Load or create element vocabulary from txt file
+    print("\nLoading element vocabulary...")
+    elements_txt_path = config['data'].get('elements_txt', 'elements.txt')
+    element_to_idx = get_element_vocab(
+        txt_path=elements_txt_path,
+        file_paths=[str(f) for f in train_files],
+        max_molecules=config['data'].get('max_molecules_for_vocab', 100000)
     )
 
     vocab_size = len(element_to_idx)
@@ -216,7 +223,10 @@ def create_model(config, device):
         max_bonds=config['model']['max_bonds'],
         vocab_size=config['model']['vocab_size'],
         embedding_dim=config['model']['embedding_dim'],
-        depth=config['model'].get('depth', 1)
+        depth=config['model'].get('depth', 1),
+        use_bond_types=config['model'].get('use_bond_types', True),
+        num_bond_types=config['model'].get('num_bond_types', 4),
+        bond_embedding_dim=config['model'].get('bond_embedding_dim', 8)
     ).to(device)
 
     # Initialize weights
@@ -229,7 +239,11 @@ def create_model(config, device):
     print(f"  Embedding dim: {config['model']['embedding_dim']}")
     print(f"  Vocabulary size: {config['model']['vocab_size']}")
     print(f"  Max bonds: {config['model']['max_bonds']}")
-    print(f"  Depth (GCN layers): {config['model'].get('depth', 1)}")
+    print(f"  Depth (GAT layers): {config['model'].get('depth', 1)}")
+    print(f"  Use bond types: {config['model'].get('use_bond_types', True)}")
+    if config['model'].get('use_bond_types', True):
+        print(f"  Bond types: {config['model'].get('num_bond_types', 4)} (single, aromatic, double, triple)")
+        print(f"  Bond embedding dim: {config['model'].get('bond_embedding_dim', 8)}")
     print(f"  Total parameters: {num_params:,}")
 
     print("="*60 + "\n")
@@ -381,8 +395,7 @@ def create_optimizer_and_scheduler(model, config):
             optimizer,
             mode=params.get('mode', 'min'),
             factor=params.get('factor', 0.7),
-            patience=params.get('patience', 2),
-            verbose=True
+            patience=params.get('patience', 2)
         )
         print(f"  Scheduler: ReduceLROnPlateau (factor={params.get('factor', 0.7)}, patience={params.get('patience', 2)})")
 
@@ -413,13 +426,12 @@ def create_optimizer_and_scheduler(model, config):
     return optimizer, scheduler
 
 
-def init_wandb(config, args):
+def init_wandb(config):
     """
     Initialize Weights & Biases logging.
 
     Args:
         config: Configuration dict
-        args: Command-line arguments
 
     Returns:
         bool: True if wandb initialized successfully
@@ -456,13 +468,15 @@ def init_wandb(config, args):
             'embedding_dim': config['model']['embedding_dim'],
             'max_bonds': config['model']['max_bonds'],
             'depth': config['model'].get('depth', 1),
+            'use_bond_types': config['model'].get('use_bond_types', True),
+            'num_bond_types': config['model'].get('num_bond_types', 4),
+            'bond_embedding_dim': config['model'].get('bond_embedding_dim', 8),
             'val_split_ratio': config['data'].get('val_split_ratio', 0.0),
             'weight_decay': config['training'].get('weight_decay', 0.001),
             'grad_clip': config['training'].get('grad_clip', 1.0),
             'loss_weights': {
                 'distance': config['loss']['distance_weight'],
                 'geometry': config['loss']['geometry_weight'],
-                'r': config['loss']['r_weight'],
                 'theta': config['loss']['theta_weight'],
                 'phi': config['loss']['phi_weight']
             }
@@ -475,29 +489,19 @@ def init_wandb(config, args):
     return True
 
 
-def main(args):
+def main():
     """
     Main training function.
-
-    Args:
-        args: Command-line arguments
     """
+    # Load configuration (from environment variable or default)
+    config_file = os.environ.get('CONFIG_FILE', 'config.yaml')
+    config = load_config(config_file)
+
     print("\n" + "="*60)
     print("Stereochemistry-Aware 3D Reconstruction GCN")
     print("="*60)
-    print(f"Config file: {args.config}")
+    print(f"Config file: {config_file}")
     print("="*60 + "\n")
-
-    # Load configuration
-    config = load_config(args.config)
-
-    # Override config with command-line arguments
-    if args.batch_size:
-        config['data']['batch_size'] = args.batch_size
-    if args.lr:
-        config['training']['learning_rate'] = args.lr
-    if args.epochs:
-        config['training']['num_epochs'] = args.epochs
 
     # Validate configuration
     validate_config(config)
@@ -520,7 +524,7 @@ def main(args):
     model = create_model(config, device)
 
     # Initialize wandb if enabled
-    use_wandb = init_wandb(config, args)
+    use_wandb = init_wandb(config)
 
     # Create optimizer and scheduler
     optimizer, scheduler = create_optimizer_and_scheduler(model, config)
@@ -531,17 +535,35 @@ def main(args):
         use_wandb=use_wandb
     )
 
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    if args.resume:
-        print(f"\nResuming from checkpoint: {args.resume}")
-        checkpoint_info = load_checkpoint(args.resume, model, optimizer, scheduler, device)
-        start_epoch = checkpoint_info['epoch']
-        print(f"Resuming from epoch {start_epoch}")
+    # Resume from checkpoint if specified in config
+    start_iteration = 0
+    resume_checkpoint = config.get('training', {}).get('resume_checkpoint', None)
+    resume_from_latest = config.get('training', {}).get('resume_from_latest', False)
+
+    # If resume_from_latest is True, find the latest checkpoint
+    if resume_from_latest and resume_checkpoint is None:
+        checkpoint_dir = config['checkpointing']['checkpoint_dir']
+        latest_checkpoint = find_latest_checkpoint(checkpoint_dir)
+        if latest_checkpoint:
+            resume_checkpoint = latest_checkpoint
+            print(f"\nFound latest checkpoint: {resume_checkpoint}")
+        else:
+            print(f"\nNo checkpoint found in {checkpoint_dir}, starting from scratch")
+
+    if resume_checkpoint:
+        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        checkpoint_info = load_checkpoint(resume_checkpoint, model, optimizer, scheduler, device)
+
+        # Extract start_iteration from checkpoint metrics
+        if 'metrics' in checkpoint_info and 'global_iteration' in checkpoint_info['metrics']:
+            start_iteration = checkpoint_info['metrics']['global_iteration']
+            print(f"Resuming from iteration {start_iteration}")
+        else:
+            print(f"No iteration info found in checkpoint, starting from iteration 0")
 
     # Checkpoint callback
     def checkpoint_callback(epoch, model, optimizer, scheduler, metrics):
-        """Save checkpoint after each epoch."""
+        """Save checkpoint every N iterations and cleanup old checkpoints."""
         save_checkpoint(
             epoch=epoch,
             model=model,
@@ -568,7 +590,8 @@ def main(args):
         device=device,
         config=config,
         checkpoint_callback=checkpoint_callback,
-        metrics_logger=metrics_logger
+        metrics_logger=metrics_logger,
+        start_iteration=start_iteration
     )
 
     # Save metrics and plots
@@ -596,51 +619,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train stereochemistry-aware 3D reconstruction GCN",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='config.yaml',
-        help='Path to YAML configuration file (default: config.yaml)'
-    )
-
-    parser.add_argument(
-        '--resume',
-        type=str,
-        default=None,
-        help='Path to checkpoint to resume from (default: None)'
-    )
-
-    # Override config parameters
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=None,
-        help='Override batch size from config'
-    )
-
-    parser.add_argument(
-        '--lr',
-        type=float,
-        default=None,
-        help='Override learning rate from config'
-    )
-
-    parser.add_argument(
-        '--epochs',
-        type=int,
-        default=None,
-        help='Override number of epochs from config'
-    )
-
-    args = parser.parse_args()
-
     try:
-        main(args)
+        main()
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user.")
     except Exception as e:

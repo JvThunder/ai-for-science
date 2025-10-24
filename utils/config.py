@@ -121,7 +121,6 @@ def get_default_config() -> Dict[str, Any]:
         'loss': {
             'distance_weight': 1.0,
             'geometry_weight': 0.3,
-            'r_weight': 1.0,
             'theta_weight': 0.5,
             'phi_weight': 0.5
         },

@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 
 # Optional wandb import
 try:
@@ -44,16 +45,22 @@ class MetricsLogger:
     - summary(): Print training summary
     """
 
-    def __init__(self, log_dir: str = "logs", use_wandb: bool = False):
+    def __init__(self, log_dir: str = "logs", use_wandb: bool = False, run_timestamp: str = None):
         """
         Initialize metrics logger.
 
         Args:
             log_dir: Directory to save logs and plots
             use_wandb: Enable Weights & Biases logging
+            run_timestamp: Timestamp string for this training run (default: auto-generated)
         """
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
+
+        # Generate timestamp for this run
+        if run_timestamp is None:
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.run_timestamp = run_timestamp
 
         # Wandb setup
         self.use_wandb = use_wandb and WANDB_AVAILABLE
@@ -61,8 +68,8 @@ class MetricsLogger:
             print("Warning: wandb requested but not installed. Install with: pip install wandb")
             print("Continuing without wandb logging...")
 
-        # Metrics storage
-        self.epochs = []
+        # Metrics storage (using iterations instead of epochs)
+        self.iterations = []
         self.train_losses = []
         self.val_losses = []
         self.learning_rates = []
@@ -84,23 +91,25 @@ class MetricsLogger:
 
     def log(
         self,
-        epoch: int,
+        iteration: int,
         train_loss: float,
         val_loss: Optional[float] = None,
         metrics: Optional[Dict] = None,
-        lr: Optional[float] = None
+        lr: Optional[float] = None,
+        epoch: int = None
     ):
         """
-        Log metrics for an epoch.
+        Log metrics for an iteration.
 
         Args:
-            epoch: Epoch number
+            iteration: Global iteration number
             train_loss: Training loss
             val_loss: Validation loss (optional)
             metrics: Dictionary of additional metrics
             lr: Current learning rate
+            epoch: Epoch number (optional, for backward compatibility)
         """
-        self.epochs.append(epoch)
+        self.iterations.append(iteration)
         self.train_losses.append(train_loss)
 
         if val_loss is not None:
@@ -139,10 +148,12 @@ class MetricsLogger:
         # Log to wandb if enabled
         if self.use_wandb:
             wandb_dict = {
-                'epoch': epoch,
+                'iteration': iteration,
                 'train/loss': train_loss,
                 'train/learning_rate': lr
             }
+            if epoch is not None:
+                wandb_dict['epoch'] = epoch
 
             if val_loss is not None:
                 wandb_dict['val/loss'] = val_loss
@@ -168,19 +179,23 @@ class MetricsLogger:
                 if 'phi_mae' in metrics:
                     wandb_dict['metrics/phi_mae'] = metrics['phi_mae']
 
-            wandb.log(wandb_dict, step=epoch)
+            wandb.log(wandb_dict, step=iteration)
 
-    def save(self, filename: str = "metrics.json"):
+    def save(self, filename: str = None):
         """
-        Save metrics to JSON file.
+        Save metrics to JSON file with timestamp.
 
         Args:
-            filename: Filename for JSON (saved in log_dir)
+            filename: Filename for JSON (default: metrics_{timestamp}.json)
         """
+        if filename is None:
+            filename = f"metrics_{self.run_timestamp}.json"
+
         filepath = os.path.join(self.log_dir, filename)
 
         metrics_dict = {
-            'epochs': self.epochs,
+            'run_timestamp': self.run_timestamp,
+            'iterations': self.iterations,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'learning_rates': self.learning_rates,
@@ -200,19 +215,22 @@ class MetricsLogger:
 
         print(f"Metrics saved to: {filepath}")
 
-    def load(self, filename: str = "metrics.json"):
+    def load(self, filename: str = None):
         """
         Load metrics from JSON file.
 
         Args:
-            filename: Filename to load from
+            filename: Filename to load from (default: most recent metrics file)
         """
+        if filename is None:
+            filename = f"metrics_{self.run_timestamp}.json"
+
         filepath = os.path.join(self.log_dir, filename)
 
         with open(filepath, 'r') as f:
             metrics_dict = json.load(f)
 
-        self.epochs = metrics_dict.get('epochs', [])
+        self.iterations = metrics_dict.get('iterations', metrics_dict.get('epochs', []))
         self.train_losses = metrics_dict.get('train_losses', [])
         self.val_losses = metrics_dict.get('val_losses', [])
         self.learning_rates = metrics_dict.get('learning_rates', [])
@@ -249,11 +267,11 @@ class MetricsLogger:
         # Plot 1: Total loss curves
         ax = axes[0, 0]
         if len(self.train_losses) > 0:
-            ax.plot(self.epochs, self.train_losses, 'b-', label='Training Loss', linewidth=2)
+            ax.plot(self.iterations, self.train_losses, 'b-', label='Training Loss', linewidth=2)
         if len(self.val_losses) > 0:
-            val_epochs = self.epochs[:len(self.val_losses)]
-            ax.plot(val_epochs, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
-        ax.set_xlabel('Epoch')
+            val_iterations = self.iterations[:len(self.val_losses)]
+            ax.plot(val_iterations, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
+        ax.set_xlabel('Iteration')
         ax.set_ylabel('Loss')
         ax.set_title('Total Loss')
         ax.legend()
@@ -262,18 +280,18 @@ class MetricsLogger:
         # Plot 2: Component losses
         ax = axes[0, 1]
         if len(self.train_distance_losses) > 0:
-            ax.plot(self.epochs[:len(self.train_distance_losses)],
+            ax.plot(self.iterations[:len(self.train_distance_losses)],
                    self.train_distance_losses, 'b--', label='Train Distance', alpha=0.7)
         if len(self.train_geometry_losses) > 0:
-            ax.plot(self.epochs[:len(self.train_geometry_losses)],
+            ax.plot(self.iterations[:len(self.train_geometry_losses)],
                    self.train_geometry_losses, 'b:', label='Train Geometry', alpha=0.7)
         if len(self.val_distance_losses) > 0:
-            val_epochs = self.epochs[:len(self.val_distance_losses)]
-            ax.plot(val_epochs, self.val_distance_losses, 'r--', label='Val Distance', alpha=0.7)
+            val_iterations = self.iterations[:len(self.val_distance_losses)]
+            ax.plot(val_iterations, self.val_distance_losses, 'r--', label='Val Distance', alpha=0.7)
         if len(self.val_geometry_losses) > 0:
-            val_epochs = self.epochs[:len(self.val_geometry_losses)]
-            ax.plot(val_epochs, self.val_geometry_losses, 'r:', label='Val Geometry', alpha=0.7)
-        ax.set_xlabel('Epoch')
+            val_iterations = self.iterations[:len(self.val_geometry_losses)]
+            ax.plot(val_iterations, self.val_geometry_losses, 'r:', label='Val Geometry', alpha=0.7)
+        ax.set_xlabel('Iteration')
         ax.set_ylabel('Loss')
         ax.set_title('Component Losses')
         ax.legend()
@@ -282,9 +300,9 @@ class MetricsLogger:
         # Plot 3: Learning rate
         ax = axes[1, 0]
         if len(self.learning_rates) > 0:
-            ax.plot(self.epochs[:len(self.learning_rates)],
+            ax.plot(self.iterations[:len(self.learning_rates)],
                    self.learning_rates, 'g-', linewidth=2)
-            ax.set_xlabel('Epoch')
+            ax.set_xlabel('Iteration')
             ax.set_ylabel('Learning Rate')
             ax.set_title('Learning Rate Schedule')
             ax.set_yscale('log')
@@ -293,15 +311,15 @@ class MetricsLogger:
         # Plot 4: Angle errors
         ax = axes[1, 1]
         if len(self.distance_maes) > 0:
-            ax.plot(self.epochs[:len(self.distance_maes)],
+            ax.plot(self.iterations[:len(self.distance_maes)],
                    self.distance_maes, 'b-', label='Distance MAE (Å)', linewidth=2)
         if len(self.theta_maes) > 0:
-            theta_epochs = self.epochs[:len(self.theta_maes)]
-            ax.plot(theta_epochs, self.theta_maes, 'r-', label='Theta MAE (°)', linewidth=2)
+            theta_iterations = self.iterations[:len(self.theta_maes)]
+            ax.plot(theta_iterations, self.theta_maes, 'r-', label='Theta MAE (°)', linewidth=2)
         if len(self.phi_maes) > 0:
-            phi_epochs = self.epochs[:len(self.phi_maes)]
-            ax.plot(phi_epochs, self.phi_maes, 'g-', label='Phi MAE (°)', linewidth=2)
-        ax.set_xlabel('Epoch')
+            phi_iterations = self.iterations[:len(self.phi_maes)]
+            ax.plot(phi_iterations, self.phi_maes, 'g-', label='Phi MAE (°)', linewidth=2)
+        ax.set_xlabel('Iteration')
         ax.set_ylabel('Error')
         ax.set_title('Angle Errors')
         ax.legend()
@@ -311,7 +329,7 @@ class MetricsLogger:
 
         # Save plot
         if save:
-            plot_path = os.path.join(self.log_dir, 'training_metrics.png')
+            plot_path = os.path.join(self.log_dir, f'training_metrics_{self.run_timestamp}.png')
             plt.savefig(plot_path, dpi=300, bbox_inches='tight')
             print(f"Plot saved to: {plot_path}")
 
