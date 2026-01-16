@@ -15,7 +15,7 @@ import torch
 import math
 import random
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 
 def create_orthonormal_frame(bond_axis: torch.Tensor, epsilon: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -71,7 +71,8 @@ def compute_local_geometry(
     neighbor_indices: List[int],
     reference_idx: int,
     epsilon: float = 1e-6,
-    augment_rotation: bool = False
+    augment_rotation: bool = False,
+    neighbor_sort_keys: Optional[List[Tuple]] = None
 ) -> Tuple[List[int], List[Tuple[float, float, float]], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Compute local Spherical coordinates (r, θ, φ) for neighbors of center_idx,
@@ -90,6 +91,9 @@ def compute_local_geometry(
         reference_idx: Index of reference atom (defines local z-axis)
         epsilon: Threshold for numerical stability (default: 1e-6)
         augment_rotation: If True, apply random rotation to φ angles (for training)
+        neighbor_sort_keys: Optional list of sort keys for each neighbor (same length as neighbor_indices).
+                           If provided, neighbors are sorted by these keys instead of φ angle.
+                           This enables deterministic ordering for reconstruction.
 
     Returns:
         ordered_neighbor_indices: List of neighbor indices ordered by φ (clockwise)
@@ -200,8 +204,19 @@ def compute_local_geometry(
             for idx, r, theta, phi, degen in neighbor_geometry
         ]
 
-    # 5. Sort by φ (clockwise order when viewing down bond)
-    neighbor_geometry.sort(key=lambda x: x[3])  # Sort by phi
+    # 5. Sort neighbors - use deterministic keys if provided, otherwise sort by φ
+    if neighbor_sort_keys is not None:
+        # Create mapping from neighbor index to sort key
+        idx_to_key = {}
+        for i, n_idx in enumerate(neighbor_indices):
+            if n_idx != reference_idx and n_idx != center_idx and i < len(neighbor_sort_keys):
+                idx_to_key[n_idx] = neighbor_sort_keys[i]
+
+        # Sort by deterministic key (element_type, bond_order, atom_index)
+        neighbor_geometry.sort(key=lambda x: idx_to_key.get(x[0], (999, 999, x[0])))
+    else:
+        # Sort by φ (clockwise order when viewing down bond) - original behavior
+        neighbor_geometry.sort(key=lambda x: x[3])  # Sort by phi
 
     # Extract results
     ordered_indices = [idx for idx, _, _, _, _ in neighbor_geometry]
@@ -379,6 +394,54 @@ def rmsd(positions_pred: torch.Tensor, positions_true: torch.Tensor) -> float:
     diff = positions_pred - positions_true
     squared_dist = torch.sum(diff ** 2, dim=1)
     return torch.sqrt(torch.mean(squared_dist)).item()
+
+
+def get_neighbor_sort_keys(
+    neighbor_indices: List[int],
+    elements: List[str],
+    bond_orders: Optional[Dict[Tuple[int, int], float]] = None,
+    center_idx: int = -1
+) -> List[Tuple]:
+    """
+    Create deterministic sort keys for neighbors based on element type, bond order, and index.
+
+    This ensures the same neighbor ordering during training and reconstruction,
+    independent of the actual atomic positions.
+
+    Args:
+        neighbor_indices: List of neighbor atom indices
+        elements: List of element symbols for all atoms
+        bond_orders: Optional dict mapping (center, neighbor) or (neighbor, center) to bond order
+        center_idx: Index of central atom (for looking up bond orders)
+
+    Returns:
+        sort_keys: List of tuples (element_priority, bond_order, atom_index) for sorting
+
+    Element priority (alphabetical for consistency):
+        Lower number = higher priority in sort
+    """
+    # Element priority based on atomic number (common elements)
+    element_priority = {
+        'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'P': 15, 'S': 16, 'Cl': 17, 'Br': 35, 'I': 53
+    }
+
+    sort_keys = []
+    for n_idx in neighbor_indices:
+        elem = elements[n_idx] if n_idx < len(elements) else 'X'
+        elem_prio = element_priority.get(elem, 100)
+
+        # Get bond order if available
+        if bond_orders is not None and center_idx >= 0:
+            bond_order = bond_orders.get((center_idx, n_idx),
+                         bond_orders.get((n_idx, center_idx), 1.0))
+        else:
+            bond_order = 1.0
+
+        # Sort key: (element_priority, -bond_order, atom_index)
+        # Negative bond order so higher bond orders come first
+        sort_keys.append((elem_prio, -bond_order, n_idx))
+
+    return sort_keys
 
 
 def convert_to_relative_azimuthal(

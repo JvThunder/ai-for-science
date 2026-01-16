@@ -199,7 +199,7 @@ def validate_on_file(
                 batch_size = data.num_graphs
                 max_bonds = config['data']['max_bonds']
 
-                target_geom_a = data.target_geometry_a.view(batch_size, max_bonds, 3)
+                target_geom_a = data.target_geometry_a.view(batch_size, max_bonds, 2)
                 bond_mask_a = data.bond_mask_a.view(batch_size, max_bonds)
 
                 # Compute batch-wise MAE/RMSE for distances
@@ -266,13 +266,10 @@ def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, 
     # Get current file path
     current_file = train_dataset.file_paths[train_dataset.current_file_idx]
 
-    # Get validation indices from dataset's internal metadata
-    # The dataset has already computed the split, so we just extract it
-    val_split_ratio = config['data'].get('val_split_ratio', 0.1)
-
-    # Read validation molecule indices from the dataset
-    # The dataset stores valid_molecule_indices as (chunk_idx, row_in_chunk, bond_count)
-    # We need to map these back to original row indices
+    # Get k-fold configuration
+    kfold = config['data'].get('kfold', 5)
+    current_fold = config['data'].get('current_fold', 0)
+    split_seed = config.get('random_seed', 42)
 
     import pandas as pd
     import random as rand
@@ -289,7 +286,7 @@ def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, 
             if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
                 continue
 
-            coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+            coordinates, _ = parse_xyz_string(row['geometry_xyz'])
             bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
 
             if coordinates and len(coordinates) >= 2 and bonds_data:
@@ -297,18 +294,25 @@ def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, 
         except Exception:
             continue
 
-    # Apply same split logic as dataset
-    split_seed = config.get('random_seed', 42)
+    # Apply k-fold split logic (same as dataset)
     rng = rand.Random(split_seed + hash(current_file))
     shuffled_indices = list(valid_indices)
     rng.shuffle(shuffled_indices)
 
     n_total = len(shuffled_indices)
-    n_val = int(n_total * val_split_ratio)
-    n_train = n_total - n_val
+    fold_size = n_total // kfold
 
-    val_indices = sorted(shuffled_indices[n_train:])
-    train_indices = sorted(shuffled_indices[:n_train])
+    # Calculate fold boundaries
+    val_start = current_fold * fold_size
+    if current_fold == kfold - 1:
+        val_end = n_total
+    else:
+        val_end = val_start + fold_size
+
+    val_indices = sorted(shuffled_indices[val_start:val_end])
+    train_indices = sorted(shuffled_indices[:val_start] + shuffled_indices[val_end:])
+    n_train = len(train_indices)
+    n_val = len(val_indices)
 
     return {
         'file_idx': file_idx,
@@ -318,7 +322,8 @@ def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, 
         'total_molecules': n_total,
         'train_molecules': n_train,
         'val_molecules': n_val,
-        'val_split_ratio': val_split_ratio,
+        'kfold': kfold,
+        'current_fold': current_fold,
         'split_seed': split_seed,
         'train_indices': train_indices,
         'val_indices': val_indices
@@ -339,27 +344,24 @@ def _save_validation_ids(validation_info_list, config):
     total_train_molecules = sum(info['train_molecules'] for info in validation_info_list)
     total_val_molecules = sum(info['val_molecules'] for info in validation_info_list)
 
-    use_fixed_validation = config['data'].get('use_fixed_validation', False)
+    kfold = config['data'].get('kfold', 5)
+    current_fold = config['data'].get('current_fold', 0)
 
     summary = {
         'config': {
             'train_folder': config['data']['train_folder'],
-            'val_split_ratio': config['data'].get('val_split_ratio', 0.1),
-            'split_seed': config.get('random_seed', 42),
-            'use_fixed_validation': use_fixed_validation
+            'kfold': kfold,
+            'current_fold': current_fold,
+            'split_seed': config.get('random_seed', 42)
         },
         'summary': {
             'total_files': len(validation_info_list),
             'total_train_molecules': total_train_molecules,
             'total_val_molecules': total_val_molecules,
             'validation_behavior': (
-                f"FIXED VALIDATION: Validation uses only file 0 across all epochs (same molecules every epoch)."
-                if use_fixed_validation else
-                "CYCLING VALIDATION: Validation set CHANGES across epochs because each file = 1 epoch. "
-                "The validation split is deterministic for each file (same molecules are always "
-                "in the validation set for a given file), but different files contain different "
-                "molecules. Therefore, epoch 1 uses validation molecules from file 0, epoch 2 "
-                "uses validation molecules from file 1, etc."
+                f"K-fold cross-validation with k={kfold}, using fold {current_fold} for validation. "
+                f"Training uses {kfold-1}/{kfold} of data, validation uses 1/{kfold} of data. "
+                "No train/val overlap (data leakage prevented)."
             )
         },
         'files': validation_info_list
@@ -374,11 +376,7 @@ def _save_validation_ids(validation_info_list, config):
     print(f"Output: {output_path}")
     print(f"Total train molecules: {total_train_molecules:,}")
     print(f"Total val molecules: {total_val_molecules:,}")
-    if use_fixed_validation:
-        print(f"\nMode: FIXED validation (same molecules every epoch)")
-        print(f"Validation file: {validation_info_list[0]['file_name']}")
-    else:
-        print(f"\nMode: CYCLING validation (different molecules each epoch)")
+    print(f"K-fold: k={kfold}, validation fold={current_fold}")
     print(f"{'='*60}\n")
 
 
@@ -458,10 +456,11 @@ def train_multi_file(
         'learning_rates': []
     }
 
-    # Early stopping
+    # Early stopping (disabled when current_fold = -1, i.e., training on all data)
     best_val_loss = float('inf')
     patience_counter = 0
-    early_stopping_patience = config['training'].get('early_stopping_patience', 5)
+    current_fold = config['data'].get('current_fold', 0)
+    early_stopping_patience = config['training'].get('early_stopping_patience', 5) if current_fold != -1 else None
     validate_every = config['training'].get('validate_every', 1)
 
     # DataLoader parameters
@@ -507,15 +506,8 @@ def train_multi_file(
             if should_switch:
                 print(f"Switching to file {iteration + 1}/{total_files}...")
                 train_dataset.next_file()
-
-                # Conditionally switch validation dataset
-                use_fixed_validation = config['data'].get('use_fixed_validation', False)
-                if not use_fixed_validation:
-                    # Cycle validation dataset (validation molecules change each iteration)
-                    val_dataset.next_file()
-                else:
-                    # Keep validation dataset fixed (same molecules every iteration)
-                    print(f"  Validation stays on: {val_dataset.file_paths[val_dataset.current_file_idx]}")
+                # Validation dataset cycles through same files (uses k-fold split)
+                val_dataset.next_file()
             elif start_iteration > 0 and epoch == start_epoch and iteration == iteration_start:
                 # When resuming, we need to manually set the dataset to the correct file
                 print(f"Resuming at file {iteration + 1}/{total_files}...")
@@ -525,12 +517,10 @@ def train_multi_file(
                 train_dataset.current_file = train_dataset.file_paths[iteration]
                 train_dataset._load_file_metadata()
 
-                use_fixed_validation = config['data'].get('use_fixed_validation', False)
-                if not use_fixed_validation:
-                    val_dataset.chunk_cache.clear()
-                    val_dataset.current_file_idx = iteration
-                    val_dataset.current_file = val_dataset.file_paths[iteration]
-                    val_dataset._load_file_metadata()
+                val_dataset.chunk_cache.clear()
+                val_dataset.current_file_idx = iteration
+                val_dataset.current_file = val_dataset.file_paths[iteration]
+                val_dataset._load_file_metadata()
 
             # Track validation info during first epoch
             if epoch == 0 and export_validation_ids:
@@ -633,21 +623,22 @@ def train_multi_file(
                     else:
                         scheduler.step()
 
-                # Early stopping check
-                if val_metrics['total_loss'] < best_val_loss:
-                    best_val_loss = val_metrics['total_loss']
-                    patience_counter = 0
-                    print(f"  [BEST] New best validation loss: {best_val_loss:.6f}")
-                else:
-                    patience_counter += 1
-                    print(f"  No improvement ({patience_counter}/{early_stopping_patience})")
+                # Early stopping check (only if early_stopping_patience is enabled)
+                if early_stopping_patience is not None:
+                    if val_metrics['total_loss'] < best_val_loss:
+                        best_val_loss = val_metrics['total_loss']
+                        patience_counter = 0
+                        print(f"  [BEST] New best validation loss: {best_val_loss:.6f}")
+                    else:
+                        patience_counter += 1
+                        print(f"  No improvement ({patience_counter}/{early_stopping_patience})")
 
-                if patience_counter >= early_stopping_patience:
-                    print(f"\n{'='*60}")
-                    print(f"Early stopping triggered at epoch {global_epoch}")
-                    print(f"Best validation loss: {best_val_loss:.6f}")
-                    print(f"{'='*60}")
-                    return history
+                    if patience_counter >= early_stopping_patience:
+                        print(f"\n{'='*60}")
+                        print(f"Early stopping triggered at epoch {global_epoch}")
+                        print(f"Best validation loss: {best_val_loss:.6f}")
+                        print(f"{'='*60}")
+                        return history
 
             # Checkpoint every N iterations (and always save the last iteration)
             save_every_n = config['checkpointing'].get('save_every_n_iterations', 1)

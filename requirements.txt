@@ -1,15 +1,6 @@
 # Core PyTorch packages (CUDA 11.8)
-# Install with: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-torch==2.0.1+cu118
-torchvision==0.15.2
-
-# PyTorch Geometric and extensions
-# Install torch-geometric first, then extensions from PyG wheel repository
+# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 torch-geometric==2.6.1
-# torch-scatter==2.1.2
-# torch-sparse==0.6.18
-# torch-cluster==1.6.3
-# torch-spline-conv==1.2.2
 
 # Data processing and utilities
 pandas==2.0.3

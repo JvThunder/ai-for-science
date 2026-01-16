@@ -10,7 +10,8 @@ Provides functions for:
 Example config.yaml structure:
     data:
       train_folder: "./data"
-      val_split_ratio: 0.1
+      kfold: 5
+      current_fold: 0
       max_bonds: 7
       batch_size: 32
 
@@ -89,7 +90,8 @@ def get_default_config() -> Dict[str, Any]:
     config = {
         'data': {
             'train_folder': './data',
-            'val_split_ratio': 0.1,  # Fraction of each file for validation
+            'kfold': 5,  # K-fold cross-validation (default k=5)
+            'current_fold': 0,  # Which fold for validation (0 to kfold-1)
             'max_bonds': 7,
             'batch_size': 32,
             'num_workers': 4,  # Parallel data loading (set to 0 to disable)
@@ -199,10 +201,15 @@ def validate_config(config: Dict[str, Any]) -> bool:
     if not csv_files:
         raise ValueError(f"No CSV files found in training folder: {train_folder}")
 
-    # Validate val_split_ratio if specified
-    val_split_ratio = data_config.get('val_split_ratio', 0.1)
-    if val_split_ratio < 0.0 or val_split_ratio >= 1.0:
-        raise ValueError("val_split_ratio must be in range [0.0, 1.0)")
+    # Validate kfold if specified
+    kfold = data_config.get('kfold', 5)
+    if kfold < 2:
+        raise ValueError("kfold must be at least 2")
+
+    current_fold = data_config.get('current_fold', 0)
+    # current_fold == -1 means train on all data (no validation)
+    if current_fold < -1 or current_fold >= kfold:
+        raise ValueError(f"current_fold must be -1 (train all) or in range [0, {kfold-1}]")
 
     # Validate numeric ranges
     if config['data']['batch_size'] <= 0:

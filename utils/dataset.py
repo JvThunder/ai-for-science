@@ -37,7 +37,7 @@ import psutil
 
 # Import our geometry utilities
 sys.path.append(os.path.dirname(__file__))
-from geometry import compute_local_geometry, convert_to_relative_azimuthal
+from geometry import compute_local_geometry, convert_to_relative_azimuthal, get_neighbor_sort_keys
 
 
 def parse_xyz_string(xyz_string: str) -> Tuple[List[List[float]], List[str]]:
@@ -271,9 +271,10 @@ class MultiFileStreamingDataset(Dataset):
         training: bool = True,
         max_samples: Optional[int] = None,
         cache_ram_mb: int = 4096,
-        val_split_ratio: float = 0.0,
         split: Optional[str] = None,
-        split_seed: int = 42
+        split_seed: int = 42,
+        kfold: int = 5,
+        current_fold: int = 0
     ):
         """
         Initialize multi-file streaming dataset.
@@ -290,9 +291,10 @@ class MultiFileStreamingDataset(Dataset):
             training: If True, apply random rotation augmentation
             max_samples: Maximum number of samples (bonds) to use (for testing)
             cache_ram_mb: Maximum RAM for caching chunks (MB, default: 4GB)
-            val_split_ratio: Fraction of data to use for validation (0.0-1.0)
             split: Which split to use - 'train', 'val', or None (use all data)
-            split_seed: Random seed for train/val splitting (for reproducibility)
+            split_seed: Random seed for k-fold splitting (for reproducibility)
+            kfold: Number of folds for k-fold cross-validation (default: 5)
+            current_fold: Which fold to use for validation (0 to kfold-1)
         """
         super().__init__()
 
@@ -316,9 +318,10 @@ class MultiFileStreamingDataset(Dataset):
         self.include_non_bonded = include_non_bonded
         self.training = training
         self.max_samples = max_samples
-        self.val_split_ratio = val_split_ratio
         self.split = split
         self.split_seed = split_seed
+        self.kfold = kfold
+        self.current_fold = current_fold
 
         # Index mapping (lightweight - only counts, not data)
         self.valid_molecule_indices = []  # (chunk_idx, row_in_chunk, bond_count)
@@ -403,9 +406,9 @@ class MultiFileStreamingDataset(Dataset):
 
             chunk_idx += 1
 
-        # Apply train/val split if requested
-        if self.val_split_ratio > 0.0 and self.split is not None:
-            self.valid_molecule_indices = self._apply_train_val_split(all_molecule_indices)
+        # Apply k-fold train/val split
+        if self.split is not None:
+            self.valid_molecule_indices = self._apply_kfold_split(all_molecule_indices)
         else:
             self.valid_molecule_indices = all_molecule_indices
 
@@ -425,18 +428,29 @@ class MultiFileStreamingDataset(Dataset):
         split_info = f" ({self.split} split)" if self.split else ""
         print(f"Metadata loaded{split_info}: {len(self.valid_molecule_indices)} molecules, {self.total_bonds} bonds")
 
-    def _apply_train_val_split(self, all_molecule_indices: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+    def _apply_kfold_split(self, all_molecule_indices: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
         """
-        Apply train/val split to molecule indices.
+        Apply k-fold cross-validation split to molecule indices.
+
+        Special case: if current_fold == -1, train on all data (val is empty).
 
         Args:
             all_molecule_indices: List of (chunk_idx, row_in_chunk, bond_count) tuples
 
         Returns:
-            Filtered list of molecule indices for the specified split
+            Filtered list of molecule indices for the specified fold
         """
         if not all_molecule_indices:
             return []
+
+        # Special case: current_fold == -1 means train on all data, no validation
+        if self.current_fold == -1:
+            if self.split == 'train':
+                return all_molecule_indices
+            elif self.split == 'val':
+                return []  # Empty validation set
+            else:
+                return all_molecule_indices
 
         # Use a deterministic random seed for reproducible splits
         rng = random.Random(self.split_seed + hash(self.current_file))
@@ -445,16 +459,25 @@ class MultiFileStreamingDataset(Dataset):
         shuffled_indices = list(all_molecule_indices)
         rng.shuffle(shuffled_indices)
 
-        # Calculate split point
         n_total = len(shuffled_indices)
-        n_val = int(n_total * self.val_split_ratio)
-        n_train = n_total - n_val
+        fold_size = n_total // self.kfold
 
-        # Return appropriate split
+        # Calculate fold boundaries
+        val_start = self.current_fold * fold_size
+        if self.current_fold == self.kfold - 1:
+            # Last fold gets remaining samples
+            val_end = n_total
+        else:
+            val_end = val_start + fold_size
+
+        # Return appropriate split (no overlap between train and val)
         if self.split == 'train':
-            return shuffled_indices[:n_train]
+            # All indices except the validation fold
+            train_indices = shuffled_indices[:val_start] + shuffled_indices[val_end:]
+            return train_indices
         elif self.split == 'val':
-            return shuffled_indices[n_train:]
+            # Only the validation fold
+            return shuffled_indices[val_start:val_end]
         else:
             return all_molecule_indices
 
@@ -713,18 +736,36 @@ class MultiFileStreamingDataset(Dataset):
         edge_index = torch.tensor(edge_index, dtype=torch.long).t() if edge_index else torch.empty((2, 0), dtype=torch.long)
         edge_attr = torch.tensor(edge_attr, dtype=torch.long) if edge_attr else torch.empty((0,), dtype=torch.long)
 
+        # Create subgraph elements list (for deterministic neighbor ordering)
+        subgraph_elements = [elements[old_idx] for old_idx in node_list]
+
+        # Create bond orders dict for subgraph (new indices)
+        # bond_types_dict has 0=single, 1=aromatic, 2=double, 3=triple
+        # Convert to bond order: 0->1.0, 1->1.5, 2->2.0, 3->3.0
+        bond_type_to_order = {0: 1.0, 1: 1.5, 2: 2.0, 3: 3.0}
+        subgraph_bond_orders = {}
+        for (old_i, old_j), btype in bond_types_dict.items():
+            if old_i in node_mapping and old_j in node_mapping:
+                new_i, new_j = node_mapping[old_i], node_mapping[old_j]
+                subgraph_bond_orders[(new_i, new_j)] = bond_type_to_order.get(btype, 1.0)
+
         # **NEW: Compute stereochemistry-aware local geometry**
         # For node A, use A→B bond as reference
         node_a_neighbors = [node_mapping[n] for n in adjacency[node_a] if n in node_mapping]
 
         if new_node_b in node_a_neighbors:
+            # Create deterministic sort keys for neighbors of A
+            sort_keys_a = get_neighbor_sort_keys(
+                node_a_neighbors, subgraph_elements, subgraph_bond_orders, new_node_a
+            )
             # Compute local geometry for node A
             ordered_neighbors_a, geometry_a, frame_a = compute_local_geometry(
                 subgraph_pos,
                 center_idx=new_node_a,
                 neighbor_indices=node_a_neighbors,
                 reference_idx=new_node_b,
-                augment_rotation=self.training  # Random rotation during training
+                augment_rotation=self.training,  # Random rotation during training
+                neighbor_sort_keys=sort_keys_a  # Deterministic ordering
             )
         else:
             # Fallback: no local geometry
@@ -736,13 +777,18 @@ class MultiFileStreamingDataset(Dataset):
         node_b_neighbors = [node_mapping[n] for n in adjacency[node_b] if n in node_mapping]
 
         if new_node_a in node_b_neighbors:
+            # Create deterministic sort keys for neighbors of B
+            sort_keys_b = get_neighbor_sort_keys(
+                node_b_neighbors, subgraph_elements, subgraph_bond_orders, new_node_b
+            )
             # Compute local geometry for node B
             ordered_neighbors_b, geometry_b, frame_b = compute_local_geometry(
                 subgraph_pos,
                 center_idx=new_node_b,
                 neighbor_indices=node_b_neighbors,
                 reference_idx=new_node_a,
-                augment_rotation=self.training
+                augment_rotation=self.training,
+                neighbor_sort_keys=sort_keys_b  # Deterministic ordering
             )
         else:
             # Fallback: no local geometry

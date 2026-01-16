@@ -109,9 +109,7 @@ Edit `config.yaml` to set your data paths and hyperparameters:
 
 ```yaml
 data:
-  train_files:
-    - "./data/Compound_000000001_000025000_props_geom.csv"
-    - "./data/Compound_000025001_000050000_props_geom.csv"
+  train_folder: "./data"
   val_split_ratio: 0.1  # 10% of each file used for validation
   batch_size: 32
 

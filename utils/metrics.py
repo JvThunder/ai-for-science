@@ -348,7 +348,7 @@ class MetricsLogger:
         print("="*60)
 
         if len(self.train_losses) > 0:
-            print(f"\nTotal Epochs: {len(self.epochs)}")
+            print(f"\nTotal Iterations: {len(self.iterations)}")
             print(f"Final Training Loss: {self.train_losses[-1]:.6f}")
 
             if len(self.val_losses) > 0:

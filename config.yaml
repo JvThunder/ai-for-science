@@ -6,21 +6,18 @@ data:
   # Each file = 1 epoch, model cycles through all files in the folder
   train_folder: "./data"
 
-  # Validation split ratio: Fraction of each file to use for validation (0.0-1.0)
-  # A random val_split_ratio fraction is held out from each training file for validation
-  # For example, 0.1 means 90% train / 10% val split per file
-  val_split_ratio: 0.1
-
-  # Fixed validation set: Keep validation on same file(s) across all epochs
-  # If true, validation uses only the first file and stays fixed
-  # If false, validation cycles through files (each epoch validates on different molecules)
-  use_fixed_validation: true
+  # K-Fold Cross-Validation for train/val split
+  # Splits data into k folds, uses one fold for validation (no train/val overlap)
+  # Example: kfold=5, current_fold=0 → fold 0 is val (20%), folds 1-4 are train (80%)
+  # Special: current_fold=-1 → train on ALL data, validation is empty/disabled
+  kfold: 5
+  current_fold: -1  # Which fold for validation (0 to kfold-1), or -1 to train on all data
 
   # Maximum number of bonds per atom (for padding)
-  max_bonds: 7
+  max_bonds: 7 # use 3 if the dataset is limited to 3 bonds per atom
 
   # Batch size for training
-  batch_size: 512
+  batch_size: 4
 
   # Number of dataloader workers for parallel data loading (0 to disable)
   # Recommend: 4-8 for multi-core CPUs
@@ -46,10 +43,10 @@ data:
 # Model Architecture
 model:
   # Hidden dimension for GAT layers
-  hidden_dim: 32
+  hidden_dim: 64
 
   # Element embedding dimension
-  embedding_dim: 16
+  embedding_dim: 64
 
   # Vocabulary size (set automatically from data)
   vocab_size: null
@@ -59,7 +56,7 @@ model:
 
   # Depth: Number of GAT layers (graph distance from bond being evaluated)
   # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
-  depth: 1
+  depth: 3
 
   # Bond type features: Enable edge features for bond types
   # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
@@ -69,12 +66,12 @@ model:
   num_bond_types: 4
 
   # Bond type embedding dimension
-  bond_embedding_dim: 8
+  bond_embedding_dim: 64
 
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 5
+  num_epochs: 100
 
   # Resume from checkpoint (set to null or path to checkpoint file)
   # Example: "checkpoints/best_model.pt"
@@ -85,13 +82,13 @@ training:
   resume_from_latest: false
 
   # Learning rate
-  learning_rate: 0.0001
+  learning_rate: 0.001
 
   # L2 weight decay for regularization
-  weight_decay: 0.001
+  weight_decay: 0.01
 
   # Gradient clipping max norm
-  grad_clip: 1.0
+  grad_clip: 5.0
 
   # Early stopping patience (epochs without improvement)
   early_stopping_patience: 5
@@ -104,7 +101,7 @@ training:
 
   # LR scheduler parameters
   lr_scheduler_params:
-    factor: 0.7      # Reduce LR by this factor
+    factor: 0.9      # Reduce LR by this factor
     patience: 2      # Epochs without improvement before reducing LR
     mode: "min"      # Optimize for minimum loss
 
@@ -114,7 +111,7 @@ loss:
   distance_weight: 1.0
 
   # Weight for angular geometry (θ, Δφ) prediction loss
-  geometry_weight: 1.0
+  geometry_weight: 5.0
 
   # Individual angular geometry component weights (all normalized and equal)
   theta_weight: 1.0     # Polar angle (degrees) [0, 180°]
@@ -127,7 +124,7 @@ checkpointing:
 
   # Save checkpoint every N iterations (1 iteration = 1 file)
   # Set to 1 to save after every file, 2 to save every 2 files, etc.
-  save_every_n_iterations: 2
+  save_every_n_iterations: 5
 
   # Keep only N most recent checkpoints
   keep_last_n: 3
