@@ -72,6 +72,10 @@ pip install wandb==0.21.1
 
 **Option 2: Using requirements.txt**
 ```bash
+# Create a new environment
+conda create -n gcn python=3.11
+conda activate gcn
+
 # Install PyTorch first (CUDA version)
 pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
 

@@ -133,7 +133,7 @@ class LocalGeometryGCN(nn.Module):
             self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
         # Dropout for regularization
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(0.5)
 
         # Distance prediction head (A-B distance)
         # Input: concatenated embeddings of A and B
@@ -141,7 +141,7 @@ class LocalGeometryGCN(nn.Module):
         self.distance_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.4),
             nn.Linear(hidden_dim, 1),
             nn.Softplus()  # Ensures positive distances
         )

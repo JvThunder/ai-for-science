@@ -43,10 +43,10 @@ data:
 # Model Architecture
 model:
   # Hidden dimension for GAT layers
-  hidden_dim: 64
+  hidden_dim: 384
 
   # Element embedding dimension
-  embedding_dim: 64
+  embedding_dim: 16
 
   # Vocabulary size (set automatically from data)
   vocab_size: null
@@ -56,7 +56,7 @@ model:
 
   # Depth: Number of GAT layers (graph distance from bond being evaluated)
   # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
-  depth: 3
+  depth: 10
 
   # Bond type features: Enable edge features for bond types
   # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
@@ -66,7 +66,7 @@ model:
   num_bond_types: 4
 
   # Bond type embedding dimension
-  bond_embedding_dim: 64
+  bond_embedding_dim: 8
 
 # Training Configuration
 training:
@@ -108,15 +108,15 @@ training:
 # Loss Function Weights
 loss:
   # Weight for distance prediction loss (A-B bond distance)
-  distance_weight: 1.0
+  distance_weight: 1.5
 
   # Weight for angular geometry (θ, Δφ) prediction loss
-  geometry_weight: 5.0
+  geometry_weight: 1.0
 
   # Individual angular geometry component weights (all normalized and equal)
   theta_weight: 1.0     # Polar angle (degrees) [0, 180°]
   phi_weight: 1.0       # Relative azimuthal difference (degrees) [0, 360°]
-
+  
 # Checkpointing
 checkpointing:
   # Directory to save checkpoints

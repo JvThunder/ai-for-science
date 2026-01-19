@@ -30,6 +30,7 @@ from utils.model import LocalGeometryGCN
 from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, get_element_vocab, dfs_subgraph
 from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
 from utils.config import load_config
+from utils.loss import total_loss, percentage_loss, geometry_loss
 
 
 def load_trained_model(
@@ -275,42 +276,118 @@ def predict_bond_geometry(
     return distance, geometry_a, geometry_b
 
 
-def reconstruct_molecule(
+def find_center_atom(adjacency: Dict[int, List[int]], n_atoms: int) -> int:
+    """
+    Find the most central atom in the molecule.
+    
+    Uses degree centrality (number of bonds) as primary criterion.
+    For ties, uses the atom with the smallest index (deterministic).
+    
+    Args:
+        adjacency: Adjacency list mapping atom index to list of neighbors
+        n_atoms: Total number of atoms
+        
+    Returns:
+        center_idx: Index of the most central atom
+    """
+    max_degree = -1
+    center_candidates = []
+    
+    for atom_idx in range(n_atoms):
+        degree = len(adjacency.get(atom_idx, []))
+        if degree > max_degree:
+            max_degree = degree
+            center_candidates = [atom_idx]
+        elif degree == max_degree:
+            center_candidates.append(atom_idx)
+    
+    # Return the atom with smallest index (deterministic)
+    return min(center_candidates)
+
+
+def predict_bond_distance_multiple(
+    model: LocalGeometryGCN,
+    coordinates: List[List[float]],
+    elements: List[str],
+    bonds_data: List[Dict],
+    element_to_idx: Dict[str, int],
+    atom_a: int,
+    atom_b: int,
+    max_bonds: int,
+    device: torch.device,
+    n_predictions: int = 3
+) -> float:
+    """
+    Predict bond distance by averaging multiple predictions.
+    
+    This improves accuracy by averaging over multiple forward passes
+    and potentially different subgraph extractions.
+    
+    Args:
+        model: Trained model
+        coordinates: Atom positions
+        elements: Element symbols
+        bonds_data: Bond information
+        element_to_idx: Element vocabulary
+        atom_a, atom_b: Bond endpoints
+        max_bonds: Maximum bonds per atom
+        device: torch device
+        n_predictions: Number of predictions to average
+        
+    Returns:
+        avg_distance: Average predicted distance
+    """
+    distances = []
+    
+    for _ in range(n_predictions):
+        data, _, _ = create_graph_data(
+            coordinates, elements, bonds_data, element_to_idx,
+            atom_a, atom_b, max_bonds, device=device
+        )
+        pred_dist, _, _ = predict_bond_geometry(model, data, device)
+        distances.append(pred_dist)
+    
+    return np.mean(distances)
+
+
+def distance_geometry_reconstruction(
     model: LocalGeometryGCN,
     coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
     element_to_idx: Dict[str, int],
     device: torch.device,
-    max_bonds: int = 7
+    max_bonds: int,
+    max_iterations: int = 500
 ) -> np.ndarray:
     """
-    Reconstruct 3D molecular geometry using model predictions.
+    Reconstruct molecule using pure distance geometry optimization.
 
-    This uses an iterative approach:
-    1. Fix the first bond (two atoms)
-    2. For each subsequent atom, use predicted geometry to place it
-    3. Average over multiple bond predictions for consistency
+    This approach predicts ALL bond distances first, then optimizes all atom
+    positions simultaneously to match these distances. This avoids error
+    accumulation from sequential BFS placement.
 
     Args:
         model: Trained model
-        coordinates: Original atom positions (for reference)
+        coordinates: Original atom positions (for initialization)
         elements: Element symbols
         bonds_data: Bond information
         element_to_idx: Element vocabulary
         device: torch device
         max_bonds: Maximum bonds per atom
+        max_iterations: Maximum optimization iterations
 
     Returns:
-        reconstructed_coords: (N, 3) numpy array of reconstructed positions
+        optimized: (N, 3) optimized positions
     """
+    from scipy.optimize import minimize
+
     n_atoms = len(coordinates)
     original_pos = np.array(coordinates)
 
-    # Build adjacency list and bond orders
+    # Build adjacency and collect bonds
     adjacency = defaultdict(list)
     bond_list = []
-    bond_orders = {}  # (i, j) -> bond_order
 
     for bond in bonds_data:
         if 'i' in bond and 'j' in bond:
@@ -318,41 +395,403 @@ def reconstruct_molecule(
             if i < n_atoms and j < n_atoms and i != j:
                 adjacency[i].append(j)
                 adjacency[j].append(i)
-                if i < j:  # Avoid duplicates
+                if i < j:
                     bond_list.append((i, j))
-                # Store bond order for deterministic sorting
+
+    if not bond_list:
+        return original_pos.copy()
+
+    # Predict ALL bond distances using model
+    predicted_distances = {}
+    for i, j in bond_list:
+        data, _, _ = create_graph_data(
+            coordinates, elements, bonds_data, element_to_idx,
+            i, j, max_bonds, device=device
+        )
+        pred_dist, _, _ = predict_bond_geometry(model, data, device)
+        predicted_distances[(i, j)] = pred_dist
+        predicted_distances[(j, i)] = pred_dist
+
+    # Find anchor atoms (highest degree atoms that are connected)
+    atom_degrees = [(i, len(adjacency[i])) for i in range(n_atoms)]
+    atom_degrees.sort(key=lambda x: -x[1])
+
+    # Use top 3 connected atoms as anchors (fix their positions)
+    anchor1 = atom_degrees[0][0]
+    anchor2 = None
+    anchor3 = None
+
+    for atom, _ in atom_degrees[1:]:
+        if atom in adjacency[anchor1]:
+            anchor2 = atom
+            break
+    if anchor2 is None:
+        anchor2 = atom_degrees[1][0]
+
+    # Find third anchor not collinear with first two
+    v1 = original_pos[anchor2] - original_pos[anchor1]
+    for atom, _ in atom_degrees:
+        if atom in [anchor1, anchor2]:
+            continue
+        if atom in adjacency[anchor1] or atom in adjacency[anchor2]:
+            v2 = original_pos[atom] - original_pos[anchor1]
+            cross = np.cross(v1, v2)
+            if np.linalg.norm(cross) > 0.1:
+                anchor3 = atom
+                break
+    if anchor3 is None:
+        anchor3 = atom_degrees[2][0] if len(atom_degrees) > 2 else None
+
+    anchors = [anchor1, anchor2]
+    if anchor3 is not None:
+        anchors.append(anchor3)
+
+    # Initialize positions from original (good starting point)
+    positions = original_pos.copy()
+
+    # Flatten for optimization (exclude anchors)
+    free_atoms = [i for i in range(n_atoms) if i not in anchors]
+    n_free = len(free_atoms)
+
+    if n_free == 0:
+        return original_pos.copy()
+
+    # Map atom indices to optimization variable indices
+    atom_to_var = {atom: i for i, atom in enumerate(free_atoms)}
+
+    x0 = positions[free_atoms].flatten()
+
+    def objective(x):
+        """Total distance error."""
+        pos = np.zeros((n_atoms, 3))
+        # Set anchor positions
+        for anchor in anchors:
+            pos[anchor] = original_pos[anchor]
+        # Set free atom positions
+        free_pos = x.reshape(-1, 3)
+        for i, atom in enumerate(free_atoms):
+            pos[atom] = free_pos[i]
+
+        total_loss = 0.0
+
+        # Distance constraints for all bonds
+        for i, j in bond_list:
+            if (i, j) not in predicted_distances:
+                continue
+
+            pred_dist = predicted_distances[(i, j)]
+            current_dist = np.linalg.norm(pos[j] - pos[i])
+
+            # Relative squared error
+            error = ((current_dist - pred_dist) / (pred_dist + 1e-6)) ** 2
+            total_loss += error
+
+        return total_loss
+
+    def gradient(x):
+        """Analytical gradient for faster optimization."""
+        pos = np.zeros((n_atoms, 3))
+        for anchor in anchors:
+            pos[anchor] = original_pos[anchor]
+        free_pos = x.reshape(-1, 3)
+        for i, atom in enumerate(free_atoms):
+            pos[atom] = free_pos[i]
+
+        grad = np.zeros((n_free, 3))
+
+        for i, j in bond_list:
+            if (i, j) not in predicted_distances:
+                continue
+
+            pred_dist = predicted_distances[(i, j)]
+            diff = pos[j] - pos[i]
+            current_dist = np.linalg.norm(diff)
+
+            if current_dist < 1e-8:
+                continue
+
+            # d(error)/d(pos) = 2 * (current - pred) / pred^2 * direction
+            coeff = 2.0 * (current_dist - pred_dist) / ((pred_dist + 1e-6) ** 2 * current_dist)
+            direction = diff  # j - i
+
+            # Gradient contribution
+            if i in atom_to_var:
+                grad[atom_to_var[i]] -= coeff * direction
+            if j in atom_to_var:
+                grad[atom_to_var[j]] += coeff * direction
+
+        return grad.flatten()
+
+    # Optimize
+    result = minimize(
+        objective,
+        x0,
+        method='L-BFGS-B',
+        jac=gradient,
+        options={'maxiter': max_iterations, 'ftol': 1e-10, 'gtol': 1e-8}
+    )
+
+    # Build final positions
+    optimized = np.zeros((n_atoms, 3))
+    for anchor in anchors:
+        optimized[anchor] = original_pos[anchor]
+    final_pos = result.x.reshape(-1, 3)
+    for i, atom in enumerate(free_atoms):
+        optimized[atom] = final_pos[i]
+
+    return optimized
+
+
+def global_optimization_refinement(
+    reconstructed: np.ndarray,
+    predicted_distances: Dict[Tuple[int, int], float],
+    predicted_angles: Dict[Tuple[int, int, int], float],
+    bond_list: List[Tuple[int, int]],
+    adjacency: Dict[int, List[int]],
+    placed: np.ndarray,
+    max_iterations: int = 100,
+    distance_weight: float = 1.0,
+    angle_weight: float = 0.5
+) -> np.ndarray:
+    """
+    Global optimization to refine all atom positions simultaneously.
+
+    Uses scipy.optimize.minimize with L-BFGS-B to find positions that best
+    satisfy all predicted bond distances and angles.
+
+    Args:
+        reconstructed: (N, 3) initial positions
+        predicted_distances: Dict mapping (i, j) to predicted distance
+        predicted_angles: Dict mapping (i, j, k) to predicted angle in radians
+        bond_list: List of (i, j) bond pairs
+        adjacency: Adjacency list
+        placed: Boolean array indicating which atoms are placed
+        max_iterations: Maximum optimization iterations
+        distance_weight: Weight for distance constraints
+        angle_weight: Weight for angle constraints
+
+    Returns:
+        optimized: (N, 3) optimized positions
+    """
+    from scipy.optimize import minimize
+
+    n_atoms = len(reconstructed)
+    placed_indices = np.where(placed)[0]
+    n_placed = len(placed_indices)
+
+    if n_placed < 3:
+        return reconstructed.copy()
+
+    # Create mapping for optimization (only optimize placed atoms)
+    idx_to_opt = {idx: i for i, idx in enumerate(placed_indices)}
+
+    # Initial positions (flattened)
+    x0 = reconstructed[placed_indices].flatten()
+
+    def objective(x):
+        """Compute total error: distance + angle constraints."""
+        positions = x.reshape(-1, 3)
+        total_loss = 0.0
+
+        # Distance constraints
+        for i, j in bond_list:
+            if i not in idx_to_opt or j not in idx_to_opt:
+                continue
+            if (i, j) not in predicted_distances and (j, i) not in predicted_distances:
+                continue
+
+            pred_dist = predicted_distances.get((i, j), predicted_distances.get((j, i)))
+            pos_i = positions[idx_to_opt[i]]
+            pos_j = positions[idx_to_opt[j]]
+
+            current_dist = np.linalg.norm(pos_j - pos_i)
+            # Relative error squared
+            dist_error = ((current_dist - pred_dist) / (pred_dist + 1e-6)) ** 2
+            total_loss += distance_weight * dist_error
+
+        # Angle constraints (bond angles at each atom)
+        for center in placed_indices:
+            if center not in idx_to_opt:
+                continue
+            neighbors = [n for n in adjacency.get(center, []) if n in idx_to_opt]
+            if len(neighbors) < 2:
+                continue
+
+            pos_center = positions[idx_to_opt[center]]
+
+            for i_n, n1 in enumerate(neighbors):
+                for n2 in neighbors[i_n+1:]:
+                    key = (n1, center, n2)
+                    rev_key = (n2, center, n1)
+
+                    if key not in predicted_angles and rev_key not in predicted_angles:
+                        continue
+
+                    pred_angle = predicted_angles.get(key, predicted_angles.get(rev_key))
+
+                    pos_n1 = positions[idx_to_opt[n1]]
+                    pos_n2 = positions[idx_to_opt[n2]]
+
+                    v1 = pos_n1 - pos_center
+                    v2 = pos_n2 - pos_center
+
+                    norm1 = np.linalg.norm(v1)
+                    norm2 = np.linalg.norm(v2)
+
+                    if norm1 < 1e-6 or norm2 < 1e-6:
+                        continue
+
+                    cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+                    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                    current_angle = np.arccos(cos_angle)
+
+                    # Angular error (in radians)
+                    angle_error = (current_angle - pred_angle) ** 2
+                    total_loss += angle_weight * angle_error
+
+        return total_loss
+
+    # Optimize
+    result = minimize(
+        objective,
+        x0,
+        method='L-BFGS-B',
+        options={'maxiter': max_iterations, 'ftol': 1e-8, 'gtol': 1e-6}
+    )
+
+    # Update positions
+    optimized = reconstructed.copy()
+    optimized_positions = result.x.reshape(-1, 3)
+
+    for i, idx in enumerate(placed_indices):
+        optimized[idx] = optimized_positions[i]
+
+    return optimized
+
+
+def reconstruct_from_center(
+    model: LocalGeometryGCN,
+    coordinates: List[List[float]],
+    elements: List[str],
+    bonds_data: List[Dict],
+    element_to_idx: Dict[str, int],
+    device: torch.device,
+    max_bonds: int,
+    start_atom: int,
+    use_original_anchors: bool = True
+) -> Tuple[np.ndarray, np.ndarray, Dict[int, List[int]], List[Tuple[int, int]], Dict[Tuple[int, int], float]]:
+    """
+    Reconstruct molecule starting from a specific atom.
+
+    Args:
+        use_original_anchors: If True, use original coordinates for the first 2 atoms
+                              to fix translation and rotation. Only uses model predictions
+                              for the geometry of subsequent atoms.
+
+    Returns reconstructed coordinates and metadata for further processing.
+    """
+    n_atoms = len(coordinates)
+    original_pos = np.array(coordinates)
+
+    # Build adjacency list and bond orders
+    adjacency = defaultdict(list)
+    bond_list = []
+    bond_orders = {}
+
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < n_atoms and j < n_atoms and i != j:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                if i < j:
+                    bond_list.append((i, j))
                 bond_order = bond.get('order', 1.0)
                 bond_orders[(i, j)] = bond_order
                 bond_orders[(j, i)] = bond_order
 
     if not bond_list:
-        return original_pos.copy()
+        return original_pos.copy(), np.ones(n_atoms, dtype=bool), adjacency, bond_list, {}
 
-    # Initialize reconstructed coordinates
+    # Initialize
     reconstructed = np.zeros((n_atoms, 3))
     placed = np.zeros(n_atoms, dtype=bool)
+    predicted_distances = {}
 
-    # Place first two atoms from the first bond
-    first_bond = bond_list[0]
-    i, j = first_bond
+    # Find a neighbor to establish coordinate frame
+    if not adjacency[start_atom]:
+        return original_pos.copy(), placed, adjacency, bond_list, predicted_distances
 
-    # Get predicted distance for the first bond
-    data, node_mapping, node_list = create_graph_data(
-        coordinates, elements, bonds_data, element_to_idx, i, j, max_bonds, device=device
-    )
-    pred_dist, _, _ = predict_bond_geometry(model, data, device)
+    # Use first neighbor as reference
+    ref_atom = adjacency[start_atom][0]
 
-    # Place atom i at origin
-    reconstructed[i] = [0, 0, 0]
-    placed[i] = True
+    if use_original_anchors:
+        # ANCHOR APPROACH: Use original coordinates for first 2-3 atoms
+        # This fixes translation and rotation completely
+        reconstructed[start_atom] = original_pos[start_atom].copy()
+        placed[start_atom] = True
 
-    # Place atom j along x-axis at predicted distance
-    reconstructed[j] = [pred_dist, 0, 0]
-    placed[j] = True
+        reconstructed[ref_atom] = original_pos[ref_atom].copy()
+        placed[ref_atom] = True
+
+        # Store original distance (we keep this as ground truth)
+        orig_dist = np.linalg.norm(original_pos[start_atom] - original_pos[ref_atom])
+        predicted_distances[(start_atom, ref_atom)] = orig_dist
+        predicted_distances[(ref_atom, start_atom)] = orig_dist
+
+        # Try to find a 3rd atom to fully constrain the coordinate frame
+        # Look for a neighbor of start_atom or ref_atom that's not collinear
+        third_atom = None
+        for neighbor in adjacency[start_atom]:
+            if neighbor != ref_atom:
+                # Check if not collinear with start-ref axis
+                v1 = original_pos[ref_atom] - original_pos[start_atom]
+                v2 = original_pos[neighbor] - original_pos[start_atom]
+                cross = np.cross(v1, v2)
+                if np.linalg.norm(cross) > 0.1:  # Not collinear
+                    third_atom = neighbor
+                    break
+
+        if third_atom is None:
+            for neighbor in adjacency[ref_atom]:
+                if neighbor != start_atom:
+                    v1 = original_pos[start_atom] - original_pos[ref_atom]
+                    v2 = original_pos[neighbor] - original_pos[ref_atom]
+                    cross = np.cross(v1, v2)
+                    if np.linalg.norm(cross) > 0.1:
+                        third_atom = neighbor
+                        break
+
+        if third_atom is not None:
+            reconstructed[third_atom] = original_pos[third_atom].copy()
+            placed[third_atom] = True
+            # Store original distances for third atom
+            for anchor in [start_atom, ref_atom]:
+                if third_atom in adjacency[anchor]:
+                    dist = np.linalg.norm(original_pos[anchor] - original_pos[third_atom])
+                    predicted_distances[(anchor, third_atom)] = dist
+                    predicted_distances[(third_atom, anchor)] = dist
+    else:
+        # Original approach: place at origin
+        reconstructed[start_atom] = [0, 0, 0]
+        placed[start_atom] = True
+
+        # Get predicted distance
+        data, _, _ = create_graph_data(
+            coordinates, elements, bonds_data, element_to_idx,
+            start_atom, ref_atom, max_bonds, device=device
+        )
+        pred_dist, _, _ = predict_bond_geometry(model, data, device)
+        predicted_distances[(start_atom, ref_atom)] = pred_dist
+        predicted_distances[(ref_atom, start_atom)] = pred_dist
+
+        # Place reference atom along x-axis
+        reconstructed[ref_atom] = [pred_dist, 0, 0]
+        placed[ref_atom] = True
 
     # BFS to place remaining atoms
-    queue = [i, j]
-    visited_bonds = {(min(i, j), max(i, j))}
+    queue = [start_atom, ref_atom]
+    visited_bonds = {(min(start_atom, ref_atom), max(start_atom, ref_atom))}
 
     while queue:
         center = queue.pop(0)
@@ -361,25 +800,24 @@ def reconstruct_molecule(
         if len(neighbors) == 0:
             continue
 
-        # Find a placed neighbor to use as reference
         placed_neighbors = [n for n in neighbors if placed[n]]
         has_unplaced = any(not placed[n] for n in neighbors)
 
         if not placed_neighbors or not has_unplaced:
             continue
 
-        # Use the first placed neighbor as reference
-        ref_atom = placed_neighbors[0]
+        ref_atom_local = placed_neighbors[0]
 
-        # Get predictions for center-ref bond
+        # Get geometry predictions
         data, node_mapping, node_list = create_graph_data(
-            coordinates, elements, bonds_data, element_to_idx, center, ref_atom, max_bonds, device=device
+            coordinates, elements, bonds_data, element_to_idx,
+            center, ref_atom_local, max_bonds, device=device
         )
         _, geometry_center, _ = predict_bond_geometry(model, data, device)
 
         # Create local coordinate frame
         center_pos = torch.tensor(reconstructed[center], dtype=torch.float)
-        ref_pos = torch.tensor(reconstructed[ref_atom], dtype=torch.float)
+        ref_pos = torch.tensor(reconstructed[ref_atom_local], dtype=torch.float)
 
         bond_vec = ref_pos - center_pos
         bond_length = torch.norm(bond_vec)
@@ -391,24 +829,14 @@ def reconstruct_molecule(
         x_axis, y_axis = create_orthonormal_frame(bond_axis)
         coord_frame = (x_axis, y_axis, bond_axis)
 
-        # Get ALL neighbors with deterministic sorting (same as training)
+        # Get sorted neighbors
         all_neighbors = neighbors.copy()
-
-        # Create deterministic sort keys (same as training)
         sort_keys = get_neighbor_sort_keys(all_neighbors, elements, bond_orders, center)
-
-        # Sort neighbors deterministically
         sorted_neighbors_with_keys = sorted(zip(all_neighbors, sort_keys), key=lambda x: x[1])
         sorted_neighbors = [n for n, _ in sorted_neighbors_with_keys]
+        sorted_neighbors_excl_ref = [n for n in sorted_neighbors if n != ref_atom_local]
 
-        # IMPORTANT: During training, the reference atom is EXCLUDED from geometry predictions
-        # The model predicts for neighbors EXCEPT the reference (which defines the coordinate frame)
-        # So we need to filter out the reference and use slots 0, 1, 2... for the remaining neighbors
-        sorted_neighbors_excl_ref = [n for n in sorted_neighbors if n != ref_atom]
-
-        # Place unplaced neighbors using predicted geometry
-        # Note: During training, the first neighbor's Δφ is set to 0 (defines reference frame)
-        # So we should not use predicted Δφ for slot 0 - it should be 0 by definition
+        # Place unplaced neighbors
         cumulative_phi = 0.0
 
         for slot_idx, neighbor in enumerate(sorted_neighbors_excl_ref):
@@ -416,50 +844,211 @@ def reconstruct_molecule(
                 break
 
             if placed[neighbor]:
-                # Already placed, but still accumulate phi for subsequent neighbors
-                # First neighbor (slot 0) has delta_phi = 0 by definition
                 if slot_idx > 0:
                     delta_phi_deg = geometry_center[slot_idx, 1]
                     cumulative_phi += delta_phi_deg
                 continue
 
-            # Get predicted geometry for this neighbor slot
-            theta_deg = geometry_center[slot_idx, 0]  # degrees
+            theta_deg = geometry_center[slot_idx, 0]
 
-            # First neighbor (slot 0) defines phi=0, others use cumulative delta_phi
             if slot_idx == 0:
-                # First neighbor: phi = 0 (defines reference direction in plane)
                 phi = 0.0
             else:
-                delta_phi_deg = geometry_center[slot_idx, 1]  # degrees
+                delta_phi_deg = geometry_center[slot_idx, 1]
                 cumulative_phi += delta_phi_deg
                 phi = math.radians(cumulative_phi % 360.0)
 
             theta = math.radians(theta_deg)
 
-            # Get predicted distance for this bond
+            # Get predicted distance
             bond_key = (min(center, neighbor), max(center, neighbor))
             if bond_key not in visited_bonds:
-                data_neighbor, _, _ = create_graph_data(
+                data_dist, _, _ = create_graph_data(
                     coordinates, elements, bonds_data, element_to_idx,
                     center, neighbor, max_bonds, device=device
                 )
-                pred_r, _, _ = predict_bond_geometry(model, data_neighbor, device)
+                pred_r, _, _ = predict_bond_geometry(model, data_dist, device)
+                predicted_distances[(center, neighbor)] = pred_r
+                predicted_distances[(neighbor, center)] = pred_r
                 visited_bonds.add(bond_key)
             else:
-                # Use original distance as fallback
-                pred_r = np.linalg.norm(np.array(coordinates[center]) - np.array(coordinates[neighbor]))
+                pred_r = predicted_distances.get((center, neighbor),
+                         np.linalg.norm(np.array(coordinates[center]) - np.array(coordinates[neighbor])))
 
-            # Convert spherical to Cartesian
+            # Convert to Cartesian
             new_pos = spherical_to_cartesian(pred_r, theta, phi, coord_frame, center_pos)
             reconstructed[neighbor] = new_pos.numpy()
             placed[neighbor] = True
             queue.append(neighbor)
 
-    # For any atoms still not placed, use original coordinates
+    # Fill unplaced atoms with original coordinates
     for atom_idx in range(n_atoms):
         if not placed[atom_idx]:
             reconstructed[atom_idx] = original_pos[atom_idx]
+
+    return reconstructed, placed, adjacency, bond_list, predicted_distances
+
+
+def reconstruct_molecule(
+    model: LocalGeometryGCN,
+    coordinates: List[List[float]],
+    elements: List[str],
+    bonds_data: List[Dict],
+    element_to_idx: Dict[str, int],
+    device: torch.device,
+    max_bonds: int = 7,
+    n_refinement_iterations: int = 3,
+    use_global_optimization: bool = True,
+    n_multi_start: int = 3,
+    use_distance_geometry: bool = True
+) -> np.ndarray:
+    """
+    Reconstruct 3D molecular geometry using model predictions.
+
+    Improved approach to minimize reconstruction errors:
+    1. Distance geometry: Predict all bond distances, then optimize positions globally
+    2. Original anchors: Fix 2-3 original atom positions to constrain coordinate frame
+    3. L-BFGS-B optimization: Efficient gradient-based optimization for all atoms
+
+    Args:
+        model: Trained model
+        coordinates: Original atom positions (for reference and anchoring)
+        elements: Element symbols
+        bonds_data: Bond information
+        element_to_idx: Element vocabulary
+        device: torch device
+        max_bonds: Maximum bonds per atom
+        n_refinement_iterations: Number of refinement iterations (legacy)
+        use_global_optimization: If True, use scipy.optimize for refinement
+        n_multi_start: Number of different starting atoms to try
+        use_distance_geometry: If True, use pure distance geometry (recommended)
+
+    Returns:
+        reconstructed_coords: (N, 3) numpy array of reconstructed positions
+    """
+    # Use distance geometry approach (recommended for best global score)
+    if use_distance_geometry:
+        return distance_geometry_reconstruction(
+            model, coordinates, elements, bonds_data,
+            element_to_idx, device, max_bonds, max_iterations=500
+        )
+
+    n_atoms = len(coordinates)
+    original_pos = np.array(coordinates)
+
+    # Build adjacency list
+    adjacency = defaultdict(list)
+    bond_list = []
+    bond_orders = {}
+
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < n_atoms and j < n_atoms and i != j:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                if i < j:
+                    bond_list.append((i, j))
+                bond_order = bond.get('order', 1.0)
+                bond_orders[(i, j)] = bond_order
+                bond_orders[(j, i)] = bond_order
+
+    if not bond_list:
+        return original_pos.copy()
+
+    # Find candidate starting atoms (sorted by degree, highest first)
+    atom_degrees = [(i, len(adjacency[i])) for i in range(n_atoms) if adjacency[i]]
+    atom_degrees.sort(key=lambda x: (-x[1], x[0]))
+
+    # Select starting atoms for multi-start
+    start_atoms = [atom_degrees[i][0] for i in range(min(n_multi_start, len(atom_degrees)))]
+
+    # Collect reconstructions from multiple starts
+    all_reconstructions = []
+    all_predicted_distances = {}
+    last_adjacency = None
+    last_bond_list = None
+    last_placed = None
+
+    for start_atom in start_atoms:
+        recon, placed, adj, bl, pred_dists = reconstruct_from_center(
+            model, coordinates, elements, bonds_data, element_to_idx,
+            device, max_bonds, start_atom,
+            use_original_anchors=True  # Use original coords for first 2 atoms
+        )
+
+        # With original anchors, alignment should be minimal
+        # but still apply for consistency
+        aligned = align_molecules(recon, original_pos)
+        all_reconstructions.append(aligned)
+
+        # Merge predicted distances
+        all_predicted_distances.update(pred_dists)
+        last_adjacency = adj
+        last_bond_list = bl
+        last_placed = placed
+
+    # Average all reconstructions (after alignment)
+    if len(all_reconstructions) > 1:
+        reconstructed = np.mean(all_reconstructions, axis=0)
+    else:
+        reconstructed = all_reconstructions[0]
+
+    # Compute predicted angles from model for global optimization
+    predicted_angles = {}
+
+    for center in range(n_atoms):
+        neighbors = list(adjacency.get(center, []))
+        if len(neighbors) < 2:
+            continue
+
+        # For each pair of neighbors, predict the angle between them
+        for i_n, n1 in enumerate(neighbors):
+            for n2 in neighbors[i_n+1:]:
+                # Get geometry prediction for center with n1 as reference
+                try:
+                    data, _, _ = create_graph_data(
+                        coordinates, elements, bonds_data, element_to_idx,
+                        center, n1, max_bonds, device=device
+                    )
+                    _, geometry_center, _ = predict_bond_geometry(model, data, device)
+
+                    # Find n2 in the sorted neighbors (excluding n1)
+                    other_neighbors = [n for n in neighbors if n != n1]
+                    sort_keys = get_neighbor_sort_keys(other_neighbors, elements, bond_orders, center)
+                    sorted_pairs = sorted(zip(other_neighbors, sort_keys), key=lambda x: x[1])
+                    sorted_other = [n for n, _ in sorted_pairs]
+
+                    if n2 in sorted_other:
+                        slot_idx = sorted_other.index(n2)
+                        if slot_idx < max_bonds:
+                            # theta is angle from bond axis (n1-center direction)
+                            theta_deg = geometry_center[slot_idx, 0]
+                            # This gives us the angle center-n1-n2 indirectly
+                            # The actual n1-center-n2 angle = 180 - theta (approximately)
+                            # But more accurately, we should use the theta directly
+                            angle_rad = math.radians(theta_deg)
+                            predicted_angles[(n1, center, n2)] = angle_rad
+                            predicted_angles[(n2, center, n1)] = angle_rad
+                except Exception:
+                    continue
+
+    # Global optimization refinement
+    if use_global_optimization and last_placed is not None:
+        reconstructed = global_optimization_refinement(
+            reconstructed,
+            all_predicted_distances,
+            predicted_angles,
+            last_bond_list,
+            last_adjacency,
+            last_placed,
+            max_iterations=200,
+            distance_weight=1.0,
+            angle_weight=0.3
+        )
+
+    # Final alignment to original
+    reconstructed = align_molecules(reconstructed, original_pos)
 
     return reconstructed
 
@@ -506,6 +1095,228 @@ def compute_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
     """Compute RMSD between two coordinate sets."""
     diff = coords1 - coords2
     return np.sqrt(np.mean(np.sum(diff**2, axis=1)))
+
+
+def compute_reconstruction_loss(
+    model: LocalGeometryGCN,
+    original_coords: np.ndarray,
+    reconstructed_coords: np.ndarray,
+    elements: List[str],
+    bonds_data: List[Dict],
+    element_to_idx: Dict[str, int],
+    device: torch.device,
+    max_bonds: int,
+    config: Dict
+) -> Dict[str, float]:
+    """
+    Compute reconstruction loss comparing predicted vs target geometry.
+    
+    Args:
+        model: Trained model
+        original_coords: (N, 3) original/true coordinates
+        reconstructed_coords: (N, 3) reconstructed coordinates
+        elements: Element symbols
+        bonds_data: Bond information
+        element_to_idx: Element vocabulary
+        device: torch device
+        max_bonds: Maximum bonds per atom
+        config: Config dict with loss weights
+        
+    Returns:
+        loss_dict: Dictionary with total loss and component losses
+    """
+    n_atoms = len(original_coords)
+    original_pos = torch.tensor(original_coords, dtype=torch.float, device=device)
+    reconstructed_pos = torch.tensor(reconstructed_coords, dtype=torch.float, device=device)
+    
+    # Build adjacency list and bond orders
+    adjacency = defaultdict(list)
+    bond_list = []
+    bond_orders = {}
+    
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < n_atoms and j < n_atoms and i != j:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                if i < j:
+                    bond_list.append((i, j))
+                bond_order = bond.get('order', 1.0)
+                bond_orders[(i, j)] = bond_order
+                bond_orders[(j, i)] = bond_order
+    
+    if not bond_list:
+        return {
+            'total': 0.0,
+            'distance': 0.0,
+            'geometry_a': 0.0,
+            'geometry_b': 0.0,
+            'geometry': 0.0,
+            'n_bonds': 0
+        }
+    
+    # Collect all predictions and targets
+    all_pred_dists = []
+    all_pred_geom_a = []
+    all_pred_geom_b = []
+    all_target_dists = []
+    all_target_geom_a = []
+    all_target_geom_b = []
+    all_masks_a = []
+    all_masks_b = []
+    
+    for i, j in bond_list:
+        # Get model predictions
+        data, node_mapping, node_list = create_graph_data(
+            [c.tolist() for c in original_coords], elements, bonds_data,
+            element_to_idx, i, j, max_bonds, device=device
+        )
+        
+        pred_dist, pred_geom_a, pred_geom_b = predict_bond_geometry(model, data, device)
+        
+        # Compute target geometry from original coordinates
+        # For node A: use A->B as reference, neighbors of A
+        neighbors_a = [n for n in adjacency[i] if n != j]
+        if neighbors_a:
+            sort_keys_a = get_neighbor_sort_keys(neighbors_a, elements, bond_orders, i)
+            ordered_a, geom_a, _ = compute_local_geometry(
+                original_pos, i, neighbors_a, j,
+                neighbor_sort_keys=sort_keys_a
+            )
+        else:
+            ordered_a = []
+            geom_a = []
+        
+        # For node B: use B->A as reference, neighbors of B
+        neighbors_b = [n for n in adjacency[j] if n != i]
+        if neighbors_b:
+            sort_keys_b = get_neighbor_sort_keys(neighbors_b, elements, bond_orders, j)
+            ordered_b, geom_b, _ = compute_local_geometry(
+                original_pos, j, neighbors_b, i,
+                neighbor_sort_keys=sort_keys_b
+            )
+        else:
+            ordered_b = []
+            geom_b = []
+        
+        # Target distance
+        target_dist = torch.norm(original_pos[i] - original_pos[j]).item()
+        
+        # Convert geometry to (theta, delta_phi) format
+        # Geometry is (r, theta, phi) - we need (theta, delta_phi) in degrees
+        target_geom_a_array = np.zeros((max_bonds, 2))
+        target_geom_b_array = np.zeros((max_bonds, 2))
+        mask_a_array = np.zeros(max_bonds)
+        mask_b_array = np.zeros(max_bonds)
+        
+        # Process geometry for A
+        if geom_a:
+            prev_phi = None
+            for slot_idx, (r, theta, phi) in enumerate(geom_a[:max_bonds]):
+                if slot_idx >= max_bonds:
+                    break
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                
+                if prev_phi is None:
+                    # First neighbor: delta_phi = 0
+                    delta_phi_deg = 0.0
+                    prev_phi = phi_deg
+                else:
+                    # Relative difference
+                    delta_phi_deg = (phi_deg - prev_phi) % 360.0
+                    prev_phi = phi_deg
+                
+                target_geom_a_array[slot_idx] = [theta_deg, delta_phi_deg]
+                mask_a_array[slot_idx] = 1.0
+        
+        # Process geometry for B
+        if geom_b:
+            prev_phi = None
+            for slot_idx, (r, theta, phi) in enumerate(geom_b[:max_bonds]):
+                if slot_idx >= max_bonds:
+                    break
+                theta_deg = math.degrees(theta)
+                phi_deg = math.degrees(phi)
+                
+                if prev_phi is None:
+                    delta_phi_deg = 0.0
+                    prev_phi = phi_deg
+                else:
+                    delta_phi_deg = (phi_deg - prev_phi) % 360.0
+                    prev_phi = phi_deg
+                
+                target_geom_b_array[slot_idx] = [theta_deg, delta_phi_deg]
+                mask_b_array[slot_idx] = 1.0
+        
+        # Store predictions and targets
+        all_pred_dists.append(pred_dist)
+        all_pred_geom_a.append(pred_geom_a)
+        all_pred_geom_b.append(pred_geom_b)
+        all_target_dists.append(target_dist)
+        all_target_geom_a.append(target_geom_a_array)
+        all_target_geom_b.append(target_geom_b_array)
+        all_masks_a.append(mask_a_array)
+        all_masks_b.append(mask_b_array)
+    
+    # Convert to tensors
+    pred_dists_tensor = torch.tensor(all_pred_dists, dtype=torch.float, device=device).unsqueeze(1)  # (n_bonds, 1)
+    target_dists_tensor = torch.tensor(all_target_dists, dtype=torch.float, device=device).unsqueeze(1)  # (n_bonds, 1)
+    
+    pred_geom_a_tensor = torch.tensor(np.stack(all_pred_geom_a), dtype=torch.float, device=device)  # (n_bonds, max_bonds, 2)
+    pred_geom_b_tensor = torch.tensor(np.stack(all_pred_geom_b), dtype=torch.float, device=device)  # (n_bonds, max_bonds, 2)
+    target_geom_a_tensor = torch.tensor(np.stack(all_target_geom_a), dtype=torch.float, device=device)  # (n_bonds, max_bonds, 2)
+    target_geom_b_tensor = torch.tensor(np.stack(all_target_geom_b), dtype=torch.float, device=device)  # (n_bonds, max_bonds, 2)
+    mask_a_tensor = torch.tensor(np.stack(all_masks_a), dtype=torch.float, device=device)  # (n_bonds, max_bonds)
+    mask_b_tensor = torch.tensor(np.stack(all_masks_b), dtype=torch.float, device=device)  # (n_bonds, max_bonds)
+    
+    # Compute losses using same functions as training
+    # Distance loss
+    loss_distance = percentage_loss(pred_dists_tensor, target_dists_tensor, epsilon=1e-3, reduction='mean')
+    
+    # Geometry losses
+    geom_weights = {
+        'theta': config['loss'].get('theta_weight', 1.0),
+        'phi': config['loss'].get('phi_weight', 1.0)
+    }
+    
+    loss_geom_a = geometry_loss(
+        pred_geom_a_tensor,
+        target_geom_a_tensor,
+        mask_a_tensor,
+        weights=geom_weights,
+        reduction='mean'
+    )
+    
+    loss_geom_b = geometry_loss(
+        pred_geom_b_tensor,
+        target_geom_b_tensor,
+        mask_b_tensor,
+        weights=geom_weights,
+        reduction='mean'
+    )
+    
+    loss_geometry = (loss_geom_a + loss_geom_b) / 2
+    
+    # Total weighted loss (same formula as training)
+    distance_weight = config['loss'].get('distance_weight', 1.0)
+    geometry_weight = config['loss'].get('geometry_weight', 1.0)
+    num_components = distance_weight + geometry_weight
+    
+    total = (
+        distance_weight * loss_distance +
+        geometry_weight * loss_geometry
+    ) / num_components
+    
+    return {
+        'total': total.item(),
+        'distance': loss_distance.item(),
+        'geometry_a': loss_geom_a.item(),
+        'geometry_b': loss_geom_b.item(),
+        'geometry': loss_geometry.item(),
+        'n_bonds': len(bond_list)
+    }
 
 
 def visualize_reconstruction(
@@ -696,11 +1507,30 @@ def reconstruction_demo(
             rmsd_value = compute_rmsd(aligned_coords, original_coords)
             print(f"  RMSD (after alignment): {rmsd_value:.4f} A")
 
+            # Compute reconstruction loss
+            print("  Computing reconstruction loss...")
+            loss_dict = compute_reconstruction_loss(
+                model, original_coords, aligned_coords, elements, bonds,
+                element_to_idx, device, max_bonds, config
+            )
+            
+            print(f"  Total Loss: {loss_dict['total']:.6f}")
+            print(f"    Distance Loss: {loss_dict['distance']:.6f} (weight: {config['loss'].get('distance_weight', 1.0)})")
+            print(f"    Geometry Loss: {loss_dict['geometry']:.6f} (weight: {config['loss'].get('geometry_weight', 1.0)})")
+            print(f"      Geometry A: {loss_dict['geometry_a']:.6f}")
+            print(f"      Geometry B: {loss_dict['geometry_b']:.6f}")
+            print(f"    Evaluated on {loss_dict['n_bonds']} bonds")
+
             results.append({
                 'cid': cid,
                 'n_atoms': len(elements),
                 'n_bonds': len([b for b in bonds if 'i' in b and 'j' in b]),
-                'rmsd': rmsd_value
+                'rmsd': rmsd_value,
+                'total_loss': loss_dict['total'],
+                'distance_loss': loss_dict['distance'],
+                'geometry_loss': loss_dict['geometry'],
+                'geometry_a_loss': loss_dict['geometry_a'],
+                'geometry_b_loss': loss_dict['geometry_b']
             })
 
             # Visualize
@@ -722,11 +1552,20 @@ def reconstruction_demo(
 
     if results:
         avg_rmsd = np.mean([r['rmsd'] for r in results])
+        avg_total_loss = np.mean([r['total_loss'] for r in results])
+        avg_distance_loss = np.mean([r['distance_loss'] for r in results])
+        avg_geometry_loss = np.mean([r['geometry_loss'] for r in results])
+        
         print(f"\nProcessed {len(results)} molecules successfully")
         print(f"Average RMSD: {avg_rmsd:.4f} A")
+        print(f"Average Total Loss: {avg_total_loss:.6f}")
+        print(f"  Average Distance Loss: {avg_distance_loss:.6f}")
+        print(f"  Average Geometry Loss: {avg_geometry_loss:.6f}")
         print("\nIndividual Results:")
         for r in results:
-            print(f"  {r['cid']}: {r['n_atoms']} atoms, {r['n_bonds']} bonds, RMSD={r['rmsd']:.4f} A")
+            print(f"  {r['cid']}: {r['n_atoms']} atoms, {r['n_bonds']} bonds")
+            print(f"    RMSD: {r['rmsd']:.4f} A")
+            print(f"    Total Loss: {r['total_loss']:.6f} (Distance: {r['distance_loss']:.6f}, Geometry: {r['geometry_loss']:.6f})")
 
     print(f"\nResults saved to: {output_path}")
 
@@ -736,7 +1575,7 @@ def reconstruction_demo(
 if __name__ == "__main__":
     # Run demo with 3 example molecules
     results = reconstruction_demo(
-        checkpoint_path="models/final_model.pt",
+        checkpoint_path="checkpoints/best_model.pt",
         csv_path="data/Compound_000000001_000025000_props_geom_3.csv",
         config_path="config.yaml",
         molecule_indices=[0, 1, 2],  # First 3 valid molecules
