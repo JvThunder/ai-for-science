@@ -12,7 +12,12 @@
       "Bash(conda activate:*)",
       "Bash(pip install:*)",
       "Bash(head:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(chmod:*)",
+      "Bash(ls:*)",
+      "Bash(python3:*)",
+      "Bash(ln:*)",
+      "Bash(pdflatex:*)"
     ],
     "deny": [],
     "ask": []

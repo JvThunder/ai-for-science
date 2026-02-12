@@ -1,0 +1,125 @@
+# LoRA Fine-Tuning Configuration for Stereochemistry-Aware 3D GCN
+# This config enables parameter-efficient fine-tuning using LoRA adapters
+
+# Random seed for reproducibility
+random_seed: 42
+
+# ============================================================================
+# LoRA Configuration
+# ============================================================================
+lora:
+  enabled: true                                    # Enable LoRA fine-tuning
+  rank: 8                                         # Low-rank dimension (4, 8, 16, 32)
+  alpha: 16.0                                     # Scaling factor (typically 2*rank)
+  dropout: 0.1                                    # LoRA dropout rate
+
+  # Which modules to apply LoRA to
+  target_modules:
+    - "gnn_layers"                                # GAT graph neural network layers
+    - "distance_head"                             # Distance prediction MLP
+    - "geometry_head"                             # Geometry prediction MLP
+    # - "edge_projections"                        # Edge feature projections
+    # - "element_embedding"                       # Element embeddings (if vocab changes)
+
+  # Pre-trained model to fine-tune
+  pretrained_checkpoint: "models/best_model.pt"  # Path to base model
+
+  # Fine-tuning specific hyperparameters (overrides training section)
+  learning_rate: 0.001                            # Learning rate
+  weight_decay: 0.01                              # Weight decay
+
+  # Save options
+  save_merged: true                               # Save merged model (LoRA integrated)
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_folder: "./data"                          # Folder with CSV files
+  elements_txt: "elements.txt"                    # Element vocabulary file
+
+  # K-fold cross-validation
+  kfold: 5                                        # Number of folds
+  current_fold: -1                                # Validation fold (0 to k-1, or -1 to train on all data)
+
+  # Data loading
+  batch_size: 4                                   # Batch size
+  max_bonds: 7                                    # Max neighbors per atom
+  chunk_size: 10000                               # Molecules per chunk
+  cache_ram_mb: 2048                              # RAM for caching (MB)
+  max_molecules_for_vocab: 100000                 # Max molecules for vocab
+
+# ============================================================================
+# Model Configuration (must match pre-trained model)
+# ============================================================================
+model:
+  hidden_dim: 384                                 # GAT hidden dimension
+  embedding_dim: 16                               # Element embedding dimension
+  max_bonds: 7                                    # Max neighbors
+  depth: 10                                       # Number of GAT layers
+
+  # Bond type features
+  use_bond_types: true                            # Use bond type embeddings
+  num_bond_types: 4                               # Single, aromatic, double, triple
+  bond_embedding_dim: 8                           # Bond embedding dimension
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  num_epochs: 10                                  # Number of epochs
+  learning_rate: 0.001                            # Learning rate (can be overridden by lora.learning_rate)
+  weight_decay: 0.01                              # L2 regularization
+  grad_clip: 5.0                                  # Gradient clipping
+
+  # Learning rate scheduler
+  lr_scheduler: "plateau"                         # Options: plateau, step, cosine, null
+  lr_scheduler_params:
+    mode: "min"
+    factor: 0.9
+    patience: 2
+
+  # Resume settings
+  resume_checkpoint: null                         # Path to checkpoint to resume
+  resume_from_latest: false                       # Auto-resume from latest checkpoint
+
+# ============================================================================
+# Loss Configuration
+# ============================================================================
+loss:
+  # Loss component weights
+  distance_weight: 1.5                            # Bond distance loss weight
+  geometry_weight: 1.0                            # Geometry type loss weight
+  theta_weight: 1.0                               # Polar angle (θ) loss weight
+  phi_weight: 1.0                                 # Azimuthal angle (φ) loss weight
+
+# ============================================================================
+# Checkpointing Configuration
+# ============================================================================
+checkpointing:
+  checkpoint_dir: "checkpoints/lora"              # Checkpoint directory
+  save_every_n_iterations: 5                      # Save every N iterations
+  keep_last_n_checkpoints: 3                      # Keep only last N checkpoints
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+logging:
+  log_dir: "logs/lora"                            # Log directory
+  print_every_n_batches: 10                       # Print metrics frequency
+  validation_ids_file: "logs/lora/validation_ids.json"
+
+  # Weights & Biases logging (optional)
+  use_wandb: false                                # Enable W&B logging
+  wandb_project: "stereochem-gcn-lora"            # W&B project name
+  wandb_entity: null                              # W&B entity (username/team)
+  wandb_run_name: null                            # Run name (auto-generated if null)
+  wandb_tags: []                                  # List of tags for organizing runs
+  wandb_notes: null                               # Optional notes about this run
+
+# ============================================================================
+# Hardware Configuration
+# ============================================================================
+hardware:
+  device: "cuda"                                  # Device: auto, cuda, cpu
+  num_workers: 4                                  # DataLoader workers

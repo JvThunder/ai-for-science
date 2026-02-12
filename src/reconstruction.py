@@ -18,10 +18,12 @@ from mpl_toolkits.mplot3d import Axes3D
 from pathlib import Path
 import math
 import json
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings("ignore")
+import imageio
+import io
 
 # Import utilities from the project
 import sys
@@ -671,27 +673,22 @@ def global_optimization_refinement(
 
 def reconstruct_from_center(
     model: LocalGeometryGCN,
-    coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
     element_to_idx: Dict[str, int],
     device: torch.device,
     max_bonds: int,
-    start_atom: int,
-    use_original_anchors: bool = True
+    start_atom: int
 ) -> Tuple[np.ndarray, np.ndarray, Dict[int, List[int]], List[Tuple[int, int]], Dict[Tuple[int, int], float]]:
     """
-    Reconstruct molecule starting from a specific atom.
-
-    Args:
-        use_original_anchors: If True, use original coordinates for the first 2 atoms
-                              to fix translation and rotation. Only uses model predictions
-                              for the geometry of subsequent atoms.
+    Reconstruct molecule starting from a specific atom without using original coordinates.
+    
+    Places first atom at origin and second along x-axis based on model predictions.
+    Translation and rotation alignment is handled during RMSD calculation.
 
     Returns reconstructed coordinates and metadata for further processing.
     """
-    n_atoms = len(coordinates)
-    original_pos = np.array(coordinates)
+    n_atoms = len(elements)
 
     # Build adjacency list and bond orders
     adjacency = defaultdict(list)
@@ -711,7 +708,8 @@ def reconstruct_from_center(
                 bond_orders[(j, i)] = bond_order
 
     if not bond_list:
-        return original_pos.copy(), np.ones(n_atoms, dtype=bool), adjacency, bond_list, {}
+        # No bonds - place all atoms at origin
+        return np.zeros((n_atoms, 3)), np.ones(n_atoms, dtype=bool), adjacency, bond_list, {}
 
     # Initialize
     reconstructed = np.zeros((n_atoms, 3))
@@ -720,74 +718,29 @@ def reconstruct_from_center(
 
     # Find a neighbor to establish coordinate frame
     if not adjacency[start_atom]:
-        return original_pos.copy(), placed, adjacency, bond_list, predicted_distances
+        return np.zeros((n_atoms, 3)), placed, adjacency, bond_list, predicted_distances
 
     # Use first neighbor as reference
     ref_atom = adjacency[start_atom][0]
 
-    if use_original_anchors:
-        # ANCHOR APPROACH: Use original coordinates for first 2-3 atoms
-        # This fixes translation and rotation completely
-        reconstructed[start_atom] = original_pos[start_atom].copy()
-        placed[start_atom] = True
+    # Place first atom at origin
+    reconstructed[start_atom] = [0, 0, 0]
+    placed[start_atom] = True
 
-        reconstructed[ref_atom] = original_pos[ref_atom].copy()
-        placed[ref_atom] = True
+    # Get predicted distance for first bond
+    # Use temporary coordinates (will be updated as we build)
+    temp_coords = reconstructed.copy()
+    data, _, _ = create_graph_data(
+        temp_coords.tolist(), elements, bonds_data, element_to_idx,
+        start_atom, ref_atom, max_bonds, device=device
+    )
+    pred_dist, _, _ = predict_bond_geometry(model, data, device)
+    predicted_distances[(start_atom, ref_atom)] = pred_dist
+    predicted_distances[(ref_atom, start_atom)] = pred_dist
 
-        # Store original distance (we keep this as ground truth)
-        orig_dist = np.linalg.norm(original_pos[start_atom] - original_pos[ref_atom])
-        predicted_distances[(start_atom, ref_atom)] = orig_dist
-        predicted_distances[(ref_atom, start_atom)] = orig_dist
-
-        # Try to find a 3rd atom to fully constrain the coordinate frame
-        # Look for a neighbor of start_atom or ref_atom that's not collinear
-        third_atom = None
-        for neighbor in adjacency[start_atom]:
-            if neighbor != ref_atom:
-                # Check if not collinear with start-ref axis
-                v1 = original_pos[ref_atom] - original_pos[start_atom]
-                v2 = original_pos[neighbor] - original_pos[start_atom]
-                cross = np.cross(v1, v2)
-                if np.linalg.norm(cross) > 0.1:  # Not collinear
-                    third_atom = neighbor
-                    break
-
-        if third_atom is None:
-            for neighbor in adjacency[ref_atom]:
-                if neighbor != start_atom:
-                    v1 = original_pos[start_atom] - original_pos[ref_atom]
-                    v2 = original_pos[neighbor] - original_pos[ref_atom]
-                    cross = np.cross(v1, v2)
-                    if np.linalg.norm(cross) > 0.1:
-                        third_atom = neighbor
-                        break
-
-        if third_atom is not None:
-            reconstructed[third_atom] = original_pos[third_atom].copy()
-            placed[third_atom] = True
-            # Store original distances for third atom
-            for anchor in [start_atom, ref_atom]:
-                if third_atom in adjacency[anchor]:
-                    dist = np.linalg.norm(original_pos[anchor] - original_pos[third_atom])
-                    predicted_distances[(anchor, third_atom)] = dist
-                    predicted_distances[(third_atom, anchor)] = dist
-    else:
-        # Original approach: place at origin
-        reconstructed[start_atom] = [0, 0, 0]
-        placed[start_atom] = True
-
-        # Get predicted distance
-        data, _, _ = create_graph_data(
-            coordinates, elements, bonds_data, element_to_idx,
-            start_atom, ref_atom, max_bonds, device=device
-        )
-        pred_dist, _, _ = predict_bond_geometry(model, data, device)
-        predicted_distances[(start_atom, ref_atom)] = pred_dist
-        predicted_distances[(ref_atom, start_atom)] = pred_dist
-
-        # Place reference atom along x-axis
-        reconstructed[ref_atom] = [pred_dist, 0, 0]
-        placed[ref_atom] = True
+    # Place reference atom along x-axis
+    reconstructed[ref_atom] = [pred_dist, 0, 0]
+    placed[ref_atom] = True
 
     # BFS to place remaining atoms
     queue = [start_atom, ref_atom]
@@ -795,6 +748,230 @@ def reconstruct_from_center(
 
     while queue:
         center = queue.pop(0)
+        neighbors = adjacency[center]
+
+        if len(neighbors) == 0:
+            continue
+
+        placed_neighbors = [n for n in neighbors if placed[n]]
+        has_unplaced = any(not placed[n] for n in neighbors)
+
+        if not placed_neighbors or not has_unplaced:
+            continue
+
+        ref_atom_local = placed_neighbors[0]
+
+        # Get geometry predictions using reconstructed positions
+        data, node_mapping, node_list = create_graph_data(
+            reconstructed.tolist(), elements, bonds_data, element_to_idx,
+            center, ref_atom_local, max_bonds, device=device
+        )
+        _, geometry_center, _ = predict_bond_geometry(model, data, device)
+
+        # Create local coordinate frame
+        center_pos = torch.tensor(reconstructed[center], dtype=torch.float)
+        ref_pos = torch.tensor(reconstructed[ref_atom_local], dtype=torch.float)
+
+        bond_vec = ref_pos - center_pos
+        bond_length = torch.norm(bond_vec)
+
+        if bond_length < 1e-6:
+            continue
+
+        bond_axis = bond_vec / bond_length
+        x_axis, y_axis = create_orthonormal_frame(bond_axis)
+        coord_frame = (x_axis, y_axis, bond_axis)
+
+        # Get sorted neighbors
+        all_neighbors = neighbors.copy()
+        sort_keys = get_neighbor_sort_keys(all_neighbors, elements, bond_orders, center)
+        sorted_neighbors_with_keys = sorted(zip(all_neighbors, sort_keys), key=lambda x: x[1])
+        sorted_neighbors = [n for n, _ in sorted_neighbors_with_keys]
+        sorted_neighbors_excl_ref = [n for n in sorted_neighbors if n != ref_atom_local]
+
+        # Place unplaced neighbors
+        cumulative_phi = 0.0
+
+        for slot_idx, neighbor in enumerate(sorted_neighbors_excl_ref):
+            if slot_idx >= max_bonds:
+                break
+
+            if placed[neighbor]:
+                if slot_idx > 0:
+                    delta_phi_deg = geometry_center[slot_idx, 1]
+                    cumulative_phi += delta_phi_deg
+                continue
+
+            theta_deg = geometry_center[slot_idx, 0]
+
+            if slot_idx == 0:
+                phi = 0.0
+            else:
+                delta_phi_deg = geometry_center[slot_idx, 1]
+                cumulative_phi += delta_phi_deg
+                phi = math.radians(cumulative_phi % 360.0)
+
+            theta = math.radians(theta_deg)
+
+            # Get predicted distance
+            bond_key = (min(center, neighbor), max(center, neighbor))
+            if bond_key not in visited_bonds:
+                data_dist, _, _ = create_graph_data(
+                    reconstructed.tolist(), elements, bonds_data, element_to_idx,
+                    center, neighbor, max_bonds, device=device
+                )
+                pred_r, _, _ = predict_bond_geometry(model, data_dist, device)
+                predicted_distances[(center, neighbor)] = pred_r
+                predicted_distances[(neighbor, center)] = pred_r
+                visited_bonds.add(bond_key)
+            else:
+                # Use previously predicted distance
+                pred_r = predicted_distances[(center, neighbor)]
+
+            # Convert to Cartesian
+            new_pos = spherical_to_cartesian(pred_r, theta, phi, coord_frame, center_pos)
+            reconstructed[neighbor] = new_pos.numpy()
+            placed[neighbor] = True
+            queue.append(neighbor)
+
+    return reconstructed, placed, adjacency, bond_list, predicted_distances
+
+
+def reconstruct_with_bfs_tracking(
+    model: LocalGeometryGCN,
+    coordinates: List[List[float]],
+    elements: List[str],
+    bonds_data: List[Dict],
+    element_to_idx: Dict[str, int],
+    device: torch.device,
+    max_bonds: int,
+    start_atom: Optional[int] = None
+) -> Tuple[np.ndarray, List[Tuple[int, int]], List[np.ndarray]]:
+    """
+    Reconstruct molecule with BFS tracking for animation.
+
+    Returns the reconstruction along with the order of bonds placed
+    and intermediate snapshots of atom positions.
+
+    Args:
+        model: Trained model
+        coordinates: Original atom positions
+        elements: Element symbols
+        bonds_data: Bond information
+        element_to_idx: Element vocabulary
+        device: torch device
+        max_bonds: Maximum bonds per atom
+        start_atom: Starting atom index (if None, uses most central atom)
+
+    Returns:
+        final_positions: (N, 3) final reconstructed positions
+        bfs_bond_order: List of (atom_a, atom_b) tuples in BFS order
+        position_snapshots: List of (N, 3) arrays showing positions after each bond
+    """
+    n_atoms = len(coordinates)
+    original_pos = np.array(coordinates)
+
+    # Build adjacency list and bond orders
+    adjacency = defaultdict(list)
+    bond_orders = {}
+
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < n_atoms and j < n_atoms and i != j:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                bond_order = bond.get('order', 1.0)
+                bond_orders[(i, j)] = bond_order
+                bond_orders[(j, i)] = bond_order
+
+    # Find center atom if not specified
+    if start_atom is None:
+        start_atom = find_center_atom(adjacency, n_atoms)
+
+    # Initialize
+    reconstructed = np.zeros((n_atoms, 3))
+    placed = np.zeros(n_atoms, dtype=bool)
+    bfs_bond_order = []  # Tracks bonds in BFS order
+    position_snapshots = []  # Snapshots after each bond placement
+    predicted_distances = {}
+
+    # Find a neighbor to establish coordinate frame
+    if not adjacency[start_atom]:
+        return original_pos.copy(), [], [original_pos.copy()]
+
+    # Use first neighbor as reference
+    ref_atom = adjacency[start_atom][0]
+
+    # ANCHOR APPROACH: Use original coordinates for first 2-3 atoms
+    reconstructed[start_atom] = original_pos[start_atom].copy()
+    placed[start_atom] = True
+
+    reconstructed[ref_atom] = original_pos[ref_atom].copy()
+    placed[ref_atom] = True
+
+    # Record first bond
+    bfs_bond_order.append((start_atom, ref_atom))
+    position_snapshots.append(reconstructed.copy())
+
+    # Store original distance
+    orig_dist = np.linalg.norm(original_pos[start_atom] - original_pos[ref_atom])
+    predicted_distances[(start_atom, ref_atom)] = orig_dist
+    predicted_distances[(ref_atom, start_atom)] = orig_dist
+
+    # Try to find a 3rd atom to fully constrain the coordinate frame
+    third_atom = None
+    for neighbor in adjacency[start_atom]:
+        if neighbor != ref_atom:
+            v1 = original_pos[ref_atom] - original_pos[start_atom]
+            v2 = original_pos[neighbor] - original_pos[start_atom]
+            cross = np.cross(v1, v2)
+            if np.linalg.norm(cross) > 0.1:
+                third_atom = neighbor
+                break
+
+    if third_atom is None:
+        for neighbor in adjacency[ref_atom]:
+            if neighbor != start_atom:
+                v1 = original_pos[start_atom] - original_pos[ref_atom]
+                v2 = original_pos[neighbor] - original_pos[ref_atom]
+                cross = np.cross(v1, v2)
+                if np.linalg.norm(cross) > 0.1:
+                    third_atom = neighbor
+                    break
+
+    if third_atom is not None:
+        reconstructed[third_atom] = original_pos[third_atom].copy()
+        placed[third_atom] = True
+
+        # Record bond to third atom
+        if third_atom in adjacency[start_atom]:
+            bfs_bond_order.append((start_atom, third_atom))
+        else:
+            bfs_bond_order.append((ref_atom, third_atom))
+        position_snapshots.append(reconstructed.copy())
+
+        for anchor in [start_atom, ref_atom]:
+            if third_atom in adjacency[anchor]:
+                dist = np.linalg.norm(original_pos[anchor] - original_pos[third_atom])
+                predicted_distances[(anchor, third_atom)] = dist
+                predicted_distances[(third_atom, anchor)] = dist
+
+    # BFS to place remaining atoms
+    queue = deque([start_atom, ref_atom])
+    if third_atom is not None:
+        queue.append(third_atom)
+
+    visited_bonds = set()
+    visited_bonds.add((min(start_atom, ref_atom), max(start_atom, ref_atom)))
+    if third_atom is not None:
+        if third_atom in adjacency[start_atom]:
+            visited_bonds.add((min(start_atom, third_atom), max(start_atom, third_atom)))
+        if third_atom in adjacency[ref_atom]:
+            visited_bonds.add((min(ref_atom, third_atom), max(ref_atom, third_atom)))
+
+    while queue:
+        center = queue.popleft()
         neighbors = adjacency[center]
 
         if len(neighbors) == 0:
@@ -881,17 +1058,375 @@ def reconstruct_from_center(
             placed[neighbor] = True
             queue.append(neighbor)
 
+            # Record this bond in BFS order
+            bfs_bond_order.append((center, neighbor))
+            position_snapshots.append(reconstructed.copy())
+
     # Fill unplaced atoms with original coordinates
     for atom_idx in range(n_atoms):
         if not placed[atom_idx]:
             reconstructed[atom_idx] = original_pos[atom_idx]
 
-    return reconstructed, placed, adjacency, bond_list, predicted_distances
+    return reconstructed, bfs_bond_order, position_snapshots
+
+
+def get_bfs_bond_order(
+    bonds_data: List[Dict],
+    n_atoms: int,
+    start_atom: Optional[int] = None
+) -> List[Tuple[int, int]]:
+    """
+    Get BFS traversal order of bonds without doing reconstruction.
+
+    Args:
+        bonds_data: Bond information
+        n_atoms: Number of atoms
+        start_atom: Starting atom (if None, uses most connected atom)
+
+    Returns:
+        bfs_bond_order: List of (atom_a, atom_b) in BFS traversal order
+    """
+    # Build adjacency
+    adjacency = defaultdict(list)
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < n_atoms and j < n_atoms and i != j:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+
+    if not adjacency:
+        return []
+
+    # Find start atom (most connected) if not specified
+    if start_atom is None:
+        start_atom = max(range(n_atoms), key=lambda x: len(adjacency.get(x, [])))
+
+    # BFS traversal
+    visited_atoms = {start_atom}
+    visited_bonds = set()
+    bfs_bond_order = []
+    queue = deque([start_atom])
+
+    while queue:
+        current = queue.popleft()
+        for neighbor in adjacency[current]:
+            bond_key = (min(current, neighbor), max(current, neighbor))
+            if bond_key not in visited_bonds:
+                visited_bonds.add(bond_key)
+                bfs_bond_order.append((current, neighbor))
+                if neighbor not in visited_atoms:
+                    visited_atoms.add(neighbor)
+                    queue.append(neighbor)
+
+    return bfs_bond_order
+
+
+def create_bfs_animation_gif(
+    original_coords: np.ndarray,
+    reconstructed_coords: np.ndarray,
+    elements: List[str],
+    bonds_data: List[Dict],
+    bfs_bond_order: List[Tuple[int, int]],
+    cid: str,
+    save_path: str,
+    fps: int = 2,
+    show_original: bool = True
+):
+    """
+    Create an animated GIF showing bonds being highlighted in BFS order on the final structure.
+
+    The GIF shows the complete reconstructed molecule with bonds highlighted one by one
+    in BFS traversal order, displaying distance and angle information.
+
+    Args:
+        original_coords: (N, 3) original coordinates
+        reconstructed_coords: (N, 3) final reconstructed coordinates
+        elements: Element symbols
+        bonds_data: Bond information
+        bfs_bond_order: List of (atom_a, atom_b) in BFS placement order
+        cid: Compound ID
+        save_path: Path to save the GIF
+        fps: Frames per second
+        show_original: If True, show original structure on the left
+    """
+    # Element colors
+    element_colors = {
+        'H': '#FFFFFF', 'C': '#909090', 'N': '#3050F8', 'O': '#FF0D0D',
+        'F': '#90E050', 'S': '#FFFF30', 'Cl': '#1FF01F', 'Br': '#A62929',
+        'P': '#FF8000', 'I': '#940094', 'B': '#FFB5B5', 'Si': '#F0C8A0'
+    }
+    default_color = '#FF1493'
+
+    # Element sizes
+    element_sizes = {
+        'H': 200, 'C': 400, 'N': 400, 'O': 400, 'F': 350, 'S': 500,
+        'Cl': 450, 'Br': 500, 'P': 450, 'I': 550, 'B': 400, 'Si': 500
+    }
+    default_size = 400
+
+    # Get colors and sizes for atoms
+    colors = [element_colors.get(e, default_color) for e in elements]
+    sizes = [element_sizes.get(e, default_size) for e in elements]
+
+    # Parse all bonds and build adjacency
+    all_bonds = set()
+    adjacency = defaultdict(list)
+    bond_orders_dict = {}
+    for bond in bonds_data:
+        if 'i' in bond and 'j' in bond:
+            i, j = bond['i'], bond['j']
+            if i < len(elements) and j < len(elements):
+                all_bonds.add((min(i, j), max(i, j)))
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+                bond_order = bond.get('order', 1.0)
+                bond_orders_dict[(i, j)] = bond_order
+                bond_orders_dict[(j, i)] = bond_order
+
+    # Compute axis limits from all coordinates
+    all_coords_combined = np.vstack([original_coords, reconstructed_coords])
+    max_range = np.max(np.ptp(all_coords_combined, axis=0)) / 2 * 1.2
+    mid = all_coords_combined.mean(axis=0)
+
+    # Precompute bond distances and angles for annotations
+    def compute_bond_angle(pos, atom_i, atom_center, atom_j):
+        """Compute angle i-center-j in degrees."""
+        v1 = pos[atom_i] - pos[atom_center]
+        v2 = pos[atom_j] - pos[atom_center]
+        norm1 = np.linalg.norm(v1)
+        norm2 = np.linalg.norm(v2)
+        if norm1 < 1e-6 or norm2 < 1e-6:
+            return 0.0
+        cos_angle = np.dot(v1, v2) / (norm1 * norm2)
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        return np.degrees(np.arccos(cos_angle))
+
+    frames = []
+
+    # Create frames for each bond being highlighted
+    for frame_idx in range(len(bfs_bond_order)):
+        # Current highlighted bond
+        hi, hj = bfs_bond_order[frame_idx]
+
+        # Compute distance for this bond
+        bond_dist = np.linalg.norm(reconstructed_coords[hi] - reconstructed_coords[hj])
+
+        # Find angles at both atoms
+        angles_info = []
+
+        # Angles at atom hi (with hj as one arm)
+        neighbors_hi = [n for n in adjacency[hi] if n != hj]
+        for neighbor in neighbors_hi[:2]:  # Show up to 2 angles
+            angle = compute_bond_angle(reconstructed_coords, neighbor, hi, hj)
+            angles_info.append(f"{elements[neighbor]}{neighbor}-{elements[hi]}{hi}-{elements[hj]}{hj}: {angle:.1f}°")
+
+        # Angles at atom hj (with hi as one arm)
+        neighbors_hj = [n for n in adjacency[hj] if n != hi]
+        for neighbor in neighbors_hj[:2]:  # Show up to 2 angles
+            angle = compute_bond_angle(reconstructed_coords, hi, hj, neighbor)
+            angles_info.append(f"{elements[hi]}{hi}-{elements[hj]}{hj}-{elements[neighbor]}{neighbor}: {angle:.1f}°")
+
+        # Create figure
+        if show_original:
+            fig = plt.figure(figsize=(16, 7))
+            ax1 = fig.add_subplot(121, projection='3d')
+            ax2 = fig.add_subplot(122, projection='3d')
+        else:
+            fig = plt.figure(figsize=(10, 8))
+            ax2 = fig.add_subplot(111, projection='3d')
+            ax1 = None
+
+        # Plot original structure (static, all bonds shown)
+        if ax1 is not None:
+            ax1.scatter(
+                original_coords[:, 0], original_coords[:, 1], original_coords[:, 2],
+                c=colors, s=sizes, edgecolors='black', linewidths=0.5, alpha=0.9
+            )
+            for i, j in all_bonds:
+                ax1.plot(
+                    [original_coords[i, 0], original_coords[j, 0]],
+                    [original_coords[i, 1], original_coords[j, 1]],
+                    [original_coords[i, 2], original_coords[j, 2]],
+                    'k-', linewidth=2, alpha=0.6
+                )
+            ax1.set_xlabel('X (Å)', fontsize=10)
+            ax1.set_ylabel('Y (Å)', fontsize=10)
+            ax1.set_zlabel('Z (Å)', fontsize=10)
+            ax1.set_title(f'Original Structure\n{cid}', fontsize=12, fontweight='bold')
+            ax1.set_xlim(mid[0] - max_range, mid[0] + max_range)
+            ax1.set_ylim(mid[1] - max_range, mid[1] + max_range)
+            ax1.set_zlim(mid[2] - max_range, mid[2] + max_range)
+
+        # Determine which bonds and atoms are visible
+        visited_bonds = set()
+        visible_atoms = set()
+        for bond in bfs_bond_order[:frame_idx + 1]:  # Include current bond
+            visited_bonds.add((min(bond[0], bond[1]), max(bond[0], bond[1])))
+            visible_atoms.add(bond[0])
+            visible_atoms.add(bond[1])
+
+        # Plot only visible atoms (those connected by visited bonds)
+        for atom_idx in visible_atoms:
+            ax2.scatter(
+                [reconstructed_coords[atom_idx, 0]],
+                [reconstructed_coords[atom_idx, 1]],
+                [reconstructed_coords[atom_idx, 2]],
+                c=[colors[atom_idx]], s=[sizes[atom_idx]],
+                edgecolors='black', linewidths=0.5, alpha=0.9
+            )
+
+        # Draw only visited bonds (not yet visited bonds are invisible)
+        highlight_key = (min(hi, hj), max(hi, hj))
+        for i, j in all_bonds:
+            bond_key = (min(i, j), max(i, j))
+
+            if bond_key not in visited_bonds:
+                # Not yet visited - don't draw
+                continue
+            elif bond_key == highlight_key:
+                # Current bond - bright red, thick
+                ax2.plot(
+                    [reconstructed_coords[i, 0], reconstructed_coords[j, 0]],
+                    [reconstructed_coords[i, 1], reconstructed_coords[j, 1]],
+                    [reconstructed_coords[i, 2], reconstructed_coords[j, 2]],
+                    color='#FF0000', linewidth=4, alpha=1.0
+                )
+            else:
+                # Previously visited - green
+                ax2.plot(
+                    [reconstructed_coords[i, 0], reconstructed_coords[j, 0]],
+                    [reconstructed_coords[i, 1], reconstructed_coords[j, 1]],
+                    [reconstructed_coords[i, 2], reconstructed_coords[j, 2]],
+                    color='#00AA00', linewidth=2.5, alpha=0.8
+                )
+
+        # Highlight the two atoms of the current bond
+        for atom_idx in [hi, hj]:
+            ax2.scatter(
+                [reconstructed_coords[atom_idx, 0]],
+                [reconstructed_coords[atom_idx, 1]],
+                [reconstructed_coords[atom_idx, 2]],
+                c='yellow', s=sizes[atom_idx] * 1.5, edgecolors='red',
+                linewidths=2, alpha=0.7, zorder=10
+            )
+
+        ax2.set_xlabel('X (Å)', fontsize=10)
+        ax2.set_ylabel('Y (Å)', fontsize=10)
+        ax2.set_zlabel('Z (Å)', fontsize=10)
+
+        # Build info text
+        bond_type_str = ""
+        bond_order = bond_orders_dict.get((hi, hj), 1.0)
+        if bond_order == 1.0:
+            bond_type_str = "Single"
+        elif bond_order == 1.5:
+            bond_type_str = "Aromatic"
+        elif bond_order == 2.0:
+            bond_type_str = "Double"
+        elif bond_order == 3.0:
+            bond_type_str = "Triple"
+
+        title_text = f'BFS Reconstruction - Bond {frame_idx + 1}/{len(bfs_bond_order)}\n'
+        title_text += f'{elements[hi]}{hi} — {elements[hj]}{hj} ({bond_type_str})\n'
+        title_text += f'Distance: {bond_dist:.3f} Å'
+
+        ax2.set_title(title_text, fontsize=11, fontweight='bold')
+        ax2.set_xlim(mid[0] - max_range, mid[0] + max_range)
+        ax2.set_ylim(mid[1] - max_range, mid[1] + max_range)
+        ax2.set_zlim(mid[2] - max_range, mid[2] + max_range)
+
+        # Add angle info as text annotation (fixed position)
+        if angles_info:
+            angle_text = "\n".join(angles_info[:3])  # Max 3 angles
+            ax2.text2D(0.02, 0.02, f"Angles:\n{angle_text}", transform=ax2.transAxes,
+                      fontsize=8, family='monospace', verticalalignment='bottom',
+                      bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.15)  # Make room for angle text
+
+        # Save frame to buffer (fixed size, no tight bbox)
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        frame = imageio.imread(buf)
+        frames.append(frame)
+        buf.close()
+        plt.close(fig)
+
+    # Add final frame showing complete structure (hold for longer)
+    for _ in range(4):  # Hold final frame for 4x duration
+        fig = plt.figure(figsize=(16, 7) if show_original else (10, 8))
+
+        if show_original:
+            ax1 = fig.add_subplot(121, projection='3d')
+            ax2 = fig.add_subplot(122, projection='3d')
+        else:
+            ax2 = fig.add_subplot(111, projection='3d')
+            ax1 = None
+
+        if ax1 is not None:
+            ax1.scatter(
+                original_coords[:, 0], original_coords[:, 1], original_coords[:, 2],
+                c=colors, s=sizes, edgecolors='black', linewidths=0.5, alpha=0.9
+            )
+            for i, j in all_bonds:
+                ax1.plot(
+                    [original_coords[i, 0], original_coords[j, 0]],
+                    [original_coords[i, 1], original_coords[j, 1]],
+                    [original_coords[i, 2], original_coords[j, 2]],
+                    'k-', linewidth=2, alpha=0.6
+                )
+            ax1.set_xlabel('X (Å)', fontsize=10)
+            ax1.set_ylabel('Y (Å)', fontsize=10)
+            ax1.set_zlabel('Z (Å)', fontsize=10)
+            ax1.set_title(f'Original Structure\n{cid}', fontsize=12, fontweight='bold')
+            ax1.set_xlim(mid[0] - max_range, mid[0] + max_range)
+            ax1.set_ylim(mid[1] - max_range, mid[1] + max_range)
+            ax1.set_zlim(mid[2] - max_range, mid[2] + max_range)
+
+        # Complete reconstruction - all bonds green
+        ax2.scatter(
+            reconstructed_coords[:, 0], reconstructed_coords[:, 1], reconstructed_coords[:, 2],
+            c=colors, s=sizes, edgecolors='black', linewidths=0.5, alpha=0.9
+        )
+        for i, j in all_bonds:
+            ax2.plot(
+                [reconstructed_coords[i, 0], reconstructed_coords[j, 0]],
+                [reconstructed_coords[i, 1], reconstructed_coords[j, 1]],
+                [reconstructed_coords[i, 2], reconstructed_coords[j, 2]],
+                color='#00AA00', linewidth=2.5, alpha=0.9
+            )
+
+        rmsd = compute_rmsd(align_molecules(reconstructed_coords, original_coords), original_coords)
+        ax2.set_xlabel('X (Å)', fontsize=10)
+        ax2.set_ylabel('Y (Å)', fontsize=10)
+        ax2.set_zlabel('Z (Å)', fontsize=10)
+        ax2.set_title(f'BFS Reconstruction Complete\nRMSD: {rmsd:.4f} Å\n{len(bfs_bond_order)} bonds traversed',
+                     fontsize=11, fontweight='bold')
+        ax2.set_xlim(mid[0] - max_range, mid[0] + max_range)
+        ax2.set_ylim(mid[1] - max_range, mid[1] + max_range)
+        ax2.set_zlim(mid[2] - max_range, mid[2] + max_range)
+
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.15)
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        frame = imageio.imread(buf)
+        frames.append(frame)
+        buf.close()
+        plt.close(fig)
+
+    # Save GIF
+    imageio.mimsave(save_path, frames, fps=fps, loop=0)
+    print(f"Saved BFS animation GIF to {save_path}")
 
 
 def reconstruct_molecule(
     model: LocalGeometryGCN,
-    coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
     element_to_idx: Dict[str, int],
@@ -899,20 +1434,21 @@ def reconstruct_molecule(
     max_bonds: int = 7,
     n_refinement_iterations: int = 3,
     use_global_optimization: bool = True,
-    n_multi_start: int = 3,
-    use_distance_geometry: bool = True
+    n_multi_start: int = 2,
+    use_distance_geometry: bool = False
 ) -> np.ndarray:
     """
-    Reconstruct 3D molecular geometry using model predictions.
+    Reconstruct 3D molecular geometry using model predictions without original coordinates.
 
-    Improved approach to minimize reconstruction errors:
-    1. Distance geometry: Predict all bond distances, then optimize positions globally
-    2. Original anchors: Fix 2-3 original atom positions to constrain coordinate frame
-    3. L-BFGS-B optimization: Efficient gradient-based optimization for all atoms
-
+    Pure reconstruction approach:
+    1. BFS-based placement: Build structure from scratch using model predictions
+    2. Multi-start: Try multiple starting atoms and average results
+    3. Global optimization: Refine positions to match predicted distances and angles
+    
+    Note: Distance geometry approach is disabled by default as it requires original coordinates.
+    
     Args:
         model: Trained model
-        coordinates: Original atom positions (for reference and anchoring)
         elements: Element symbols
         bonds_data: Bond information
         element_to_idx: Element vocabulary
@@ -921,20 +1457,17 @@ def reconstruct_molecule(
         n_refinement_iterations: Number of refinement iterations (legacy)
         use_global_optimization: If True, use scipy.optimize for refinement
         n_multi_start: Number of different starting atoms to try
-        use_distance_geometry: If True, use pure distance geometry (recommended)
+        use_distance_geometry: Distance geometry not supported without coordinates
 
     Returns:
         reconstructed_coords: (N, 3) numpy array of reconstructed positions
     """
-    # Use distance geometry approach (recommended for best global score)
+    # Distance geometry requires original coordinates for initialization
     if use_distance_geometry:
-        return distance_geometry_reconstruction(
-            model, coordinates, elements, bonds_data,
-            element_to_idx, device, max_bonds, max_iterations=500
-        )
+        raise ValueError("Distance geometry reconstruction requires original coordinates. "
+                        "Set use_distance_geometry=False to use BFS-based reconstruction.")
 
-    n_atoms = len(coordinates)
-    original_pos = np.array(coordinates)
+    n_atoms = len(elements)
 
     # Build adjacency list
     adjacency = defaultdict(list)
@@ -954,7 +1487,8 @@ def reconstruct_molecule(
                 bond_orders[(j, i)] = bond_order
 
     if not bond_list:
-        return original_pos.copy()
+        # No bonds - place all atoms at origin
+        return np.zeros((n_atoms, 3))
 
     # Find candidate starting atoms (sorted by degree, highest first)
     atom_degrees = [(i, len(adjacency[i])) for i in range(n_atoms) if adjacency[i]]
@@ -972,15 +1506,17 @@ def reconstruct_molecule(
 
     for start_atom in start_atoms:
         recon, placed, adj, bl, pred_dists = reconstruct_from_center(
-            model, coordinates, elements, bonds_data, element_to_idx,
-            device, max_bonds, start_atom,
-            use_original_anchors=True  # Use original coords for first 2 atoms
+            model, elements, bonds_data, element_to_idx,
+            device, max_bonds, start_atom
         )
 
-        # With original anchors, alignment should be minimal
-        # but still apply for consistency
-        aligned = align_molecules(recon, original_pos)
-        all_reconstructions.append(aligned)
+        # For multi-start: align to first reconstruction for averaging
+        if len(all_reconstructions) > 0:
+            aligned = align_molecules(recon, all_reconstructions[0])
+            all_reconstructions.append(aligned)
+        else:
+            # First reconstruction - use as reference for others
+            all_reconstructions.append(recon)
 
         # Merge predicted distances
         all_predicted_distances.update(pred_dists)
@@ -1005,10 +1541,10 @@ def reconstruct_molecule(
         # For each pair of neighbors, predict the angle between them
         for i_n, n1 in enumerate(neighbors):
             for n2 in neighbors[i_n+1:]:
-                # Get geometry prediction for center with n1 as reference
+                # Get geometry prediction for center with n1 as reference using reconstructed coords
                 try:
                     data, _, _ = create_graph_data(
-                        coordinates, elements, bonds_data, element_to_idx,
+                        reconstructed.tolist(), elements, bonds_data, element_to_idx,
                         center, n1, max_bonds, device=device
                     )
                     _, geometry_center, _ = predict_bond_geometry(model, data, device)
@@ -1047,9 +1583,7 @@ def reconstruct_molecule(
             angle_weight=0.3
         )
 
-    # Final alignment to original
-    reconstructed = align_molecules(reconstructed, original_pos)
-
+    # Return reconstructed coordinates (alignment to ground truth handled by caller)
     return reconstructed
 
 
@@ -1494,13 +2028,13 @@ def reconstruction_demo(
             print(f"  Bonds: {len([b for b in bonds if 'i' in b and 'j' in b])}")
             print(f"  Elements: {set(elements)}")
 
-            # Reconstruct
+            # Reconstruct (without using original coordinates)
             print("  Reconstructing...")
             reconstructed_coords = reconstruct_molecule(
-                model, coords, elements, bonds, element_to_idx, device, max_bonds
+                model, elements, bonds, element_to_idx, device, max_bonds
             )
 
-            # Align for comparison
+            # Align reconstructed to original for comparison (handles translation/rotation)
             aligned_coords = align_molecules(reconstructed_coords, original_coords)
 
             # Compute RMSD
@@ -1533,11 +2067,31 @@ def reconstruction_demo(
                 'geometry_b_loss': loss_dict['geometry_b']
             })
 
-            # Visualize
+            # Visualize static comparison
             save_path = output_path / f"reconstruction_{cid}.png"
             visualize_reconstruction(
                 original_coords, aligned_coords, elements, bonds, cid, rmsd_value, str(save_path)
             )
+
+            # Generate BFS animation GIF
+            print("  Generating BFS animation GIF...")
+            bfs_bond_order = get_bfs_bond_order(bonds, len(elements))
+
+            if bfs_bond_order:
+                gif_path = output_path / f"bfs_reconstruction_{cid}.gif"
+                create_bfs_animation_gif(
+                    original_coords=original_coords,
+                    reconstructed_coords=aligned_coords,  # Use the final aligned reconstruction
+                    elements=elements,
+                    bonds_data=bonds,
+                    bfs_bond_order=bfs_bond_order,
+                    cid=str(cid),
+                    save_path=str(gif_path),
+                    fps=2,
+                    show_original=True
+                )
+            else:
+                print("  Warning: No bonds found for BFS animation")
 
         except Exception as e:
             print(f"  Error processing molecule {mol_idx}: {e}")
