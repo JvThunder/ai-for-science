@@ -109,15 +109,17 @@ class LocalGeometryGCN(nn.Module):
         self.gnn_layers = nn.ModuleList()
         self.batch_norms = nn.ModuleList()
 
-        # Edge feature projection layers (project bond embeddings to match node features)
-        self.edge_projections = nn.ModuleList()
-
         # First layer (input -> hidden)
         if self.use_bond_types:
-            # Project edge features to node feature space for concatenation
-            self.edge_projections.append(nn.Linear(edge_feature_dim, encoder_input_dim))
-            # GAT with concatenated edge features
-            self.gnn_layers.append(GATConv(encoder_input_dim * 2, hidden_dim, heads=4, concat=False, edge_dim=None))
+            self.gnn_layers.append(
+            GATConv(
+                encoder_input_dim,
+                hidden_dim,
+                heads=4,
+                concat=False,
+                edge_dim=edge_feature_dim
+            )
+        )
         else:
             # Standard GAT without edge features
             self.gnn_layers.append(GATConv(encoder_input_dim, hidden_dim, heads=4, concat=False))
@@ -126,8 +128,15 @@ class LocalGeometryGCN(nn.Module):
         # Additional layers (hidden -> hidden)
         for _ in range(self.depth - 1):
             if self.use_bond_types:
-                self.edge_projections.append(nn.Linear(edge_feature_dim, hidden_dim))
-                self.gnn_layers.append(GATConv(hidden_dim * 2, hidden_dim, heads=4, concat=False, edge_dim=None))
+                self.gnn_layers.append(
+            GATConv(
+                encoder_input_dim,
+                hidden_dim,
+                heads=4,
+                concat=False,
+                edge_dim=edge_feature_dim
+            )
+)
             else:
                 self.gnn_layers.append(GATConv(hidden_dim, hidden_dim, heads=4, concat=False))
             self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
@@ -203,18 +212,7 @@ class LocalGeometryGCN(nn.Module):
         # GNN encoding with batch normalization and dropout (loop through all layers)
         for i, (gnn_layer, bn_layer) in enumerate(zip(self.gnn_layers, self.batch_norms)):
             if self.use_bond_types and edge_features is not None:
-                # Project edge features
-                edge_proj = self.edge_projections[i](edge_features)
-
-                # Aggregate edge features to nodes (sum of incoming edge features)
-                # edge_index[0] is source, edge_index[1] is target
-                num_nodes = x.size(0)
-                edge_aggregated = torch.zeros(num_nodes, edge_proj.size(1), device=x.device)
-                edge_aggregated.index_add_(0, edge_index[1], edge_proj)
-
-                # Concatenate node features with aggregated edge features
-                x_with_edges = torch.cat([x, edge_aggregated], dim=-1)
-                x = gnn_layer(x_with_edges, edge_index)
+                x = gnn_layer(x, edge_index, edge_features)
             else:
                 x = gnn_layer(x, edge_index)
 
