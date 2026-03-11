@@ -102,3 +102,4 @@ logs/
 data/
 checkpoints/
 .claude/
+reconstruction_results_rmsd_vs_atoms/

@@ -24,7 +24,12 @@ Usage:
     # To automatically resume from latest checkpoint, set 'resume_from_latest' in config.yaml:
     # training:
     #   resume_from_latest: true
+
+Author: Claude Code
+Date: 2025-10-13
 """
+import warnings
+warnings.filterwarnings("ignore")
 
 import torch
 import torch.optim as optim
@@ -44,18 +49,13 @@ except ImportError:
     wandb = None
 
 # Import utilities
-from utils.config import load_config, validate_config, print_config
+from utils.config import load_config, validate_config, print_config, merge_configs
 from utils.model import LocalGeometryGCN, count_parameters, initialize_weights
 from utils.dataset import MultiFileStreamingDataset, get_element_vocab
 from utils.training import train_multi_file
 from utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
 from utils.metrics import MetricsLogger
 import json
-
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message="UnsupportedFieldAttributeWarning")
 
 def set_random_seeds(seed: int = 42):
     """
@@ -104,10 +104,7 @@ def setup_device(config):
 
 def create_datasets(config):
     """
-    Create training and validation datasets using k-fold cross-validation.
-
-    Uses k-fold splitting (default k=5) to create non-overlapping train/val sets.
-    No data leakage: validation fold is completely separate from training folds.
+    Create training and validation datasets.
 
     Args:
         config: Configuration dict
@@ -129,8 +126,8 @@ def create_datasets(config):
         raise ValueError(f"No CSV files found in {train_folder}")
 
     print(f"\nFound {len(train_files)} CSV files in {train_folder}")
-    for f in train_files:
-        print(f"  - {f.name}")
+    #for f in train_files:
+        #print(f"  - {f.name}")
 
     # Load or create element vocabulary from txt file
     print("\nLoading element vocabulary...")
@@ -147,22 +144,11 @@ def create_datasets(config):
     # Update config with vocab size
     config['model']['vocab_size'] = vocab_size
 
-    # Get k-fold configuration
-    kfold = config['data'].get('kfold', 5)  # Default k=5
-    current_fold = config['data'].get('current_fold', 0)  # Which fold for validation (-1 = train all)
-    split_seed = config.get('random_seed', 42)
+    # Get validation split ratio (default to 0.1 if not specified)
+    val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+    use_fixed_validation = config['data'].get('use_fixed_validation', False)
 
-    if current_fold == -1:
-        print(f"\nTRAIN ALL MODE (current_fold=-1)")
-        print(f"  Training: 100% of data (all molecules)")
-        print(f"  Validation: DISABLED (empty)")
-    else:
-        print(f"\nK-FOLD CROSS-VALIDATION (k={kfold}, fold={current_fold})")
-        print(f"  Training: {kfold-1}/{kfold} of data ({(kfold-1)/kfold*100:.1f}%)")
-        print(f"  Validation: 1/{kfold} of data ({1/kfold*100:.1f}%)")
-        print(f"  No train/val overlap (data leakage prevented)")
-
-    # Create training dataset
+    # Create training dataset (90% of each file)
     print("\nCreating training dataset...")
     train_dataset = MultiFileStreamingDataset(
         file_paths=[str(f) for f in train_files],
@@ -171,30 +157,35 @@ def create_datasets(config):
         chunk_size=config['data'].get('chunk_size', 10000),
         cache_ram_mb=config['data'].get('cache_ram_mb', 4096),
         training=True,  # Enable rotation augmentation
-        split='train',
-        split_seed=split_seed,
-        kfold=kfold,
-        current_fold=current_fold
+        split='train'
     )
 
     print(f"Training dataset created:")
     print(f"  Files: {len(train_dataset.file_paths)}")
     print(f"  Current file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
     print(f"  Bonds in current file: {len(train_dataset)}")
+    print(f"  Split: {int((1-val_split_ratio)*100)}% train / {int(val_split_ratio*100)}% val per file")
 
-    # Create validation dataset (uses same files, but different fold)
+    # Create validation dataset
     print("\nCreating validation dataset...")
+    if use_fixed_validation:
+        # Use only the first file for validation (stays consistent across epochs)
+        val_files = [str(train_files[0])]
+        print(f"  Mode: FIXED validation (same molecules every epoch)")
+        print(f"  Using file: {train_files[0].name}")
+    else:
+        # Use all files for validation (cycles through files like training)
+        val_files = [str(f) for f in train_files]
+        print(f"  Mode: CYCLING validation (different molecules each epoch)")
+
     val_dataset = MultiFileStreamingDataset(
-        file_paths=[str(f) for f in train_files],
-        element_to_idx=element_to_idx,
-        max_bonds=config['data']['max_bonds'],
-        chunk_size=config['data'].get('chunk_size', 10000),
-        cache_ram_mb=config['data'].get('cache_ram_mb', 4096),
-        training=False,  # No augmentation for validation
-        split='val',
-        split_seed=split_seed,
-        kfold=kfold,
-        current_fold=current_fold
+    file_paths=val_files,
+    element_to_idx=element_to_idx,
+    max_bonds=config['data']['max_bonds'],
+    chunk_size=config['data'].get('chunk_size', 10000),
+    cache_ram_mb=config['data'].get('cache_ram_mb', 4096),
+    training=False,
+    split='val'
     )
     print(f"Validation dataset created:")
     print(f"  Files: {len(val_dataset.file_paths)}")
@@ -257,7 +248,7 @@ def create_model(config, device):
 
 def export_validation_ids_to_file(config, train_dataset, val_dataset):
     """
-    Export validation molecule IDs to JSON file using k-fold split info.
+    Export validation molecule IDs to JSON file.
 
     Args:
         config: Configuration dict
@@ -271,15 +262,12 @@ def export_validation_ids_to_file(config, train_dataset, val_dataset):
     output_path = Path(config['logging'].get('validation_ids_file', 'logs/validation_ids.json'))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Get k-fold configuration
-    kfold = config['data'].get('kfold', 5)
-    current_fold = config['data'].get('current_fold', 0)
-    split_seed = config.get('random_seed', 42)
-
     # Get validation split info for all files
     all_validation_info = []
 
     for file_idx, file_path in enumerate(train_dataset.file_paths):
+        # Get validation indices from the dataset's split logic
+        # We need to replicate the split logic to get the indices
         import pandas as pd
         import random as rand
 
@@ -296,7 +284,7 @@ def export_validation_ids_to_file(config, train_dataset, val_dataset):
                 if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
                     continue
 
-                coordinates, _ = parse_xyz_string(row['geometry_xyz'])
+                coordinates, elements = parse_xyz_string(row['geometry_xyz'])
                 bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
 
                 if coordinates and len(coordinates) >= 2 and bonds_data:
@@ -304,26 +292,20 @@ def export_validation_ids_to_file(config, train_dataset, val_dataset):
             except Exception:
                 continue
 
-        # Apply k-fold split logic (same as dataset)
+        # Apply same split logic as dataset
+        val_split_ratio = config['data'].get('val_split_ratio', 0.1)
+        split_seed = config.get('random_seed', 42)
+
         rng = rand.Random(split_seed + hash(file_path))
         shuffled_indices = list(valid_indices)
         rng.shuffle(shuffled_indices)
 
         n_total = len(shuffled_indices)
-        fold_size = n_total // kfold
+        n_val = int(n_total * val_split_ratio)
+        n_train = n_total - n_val
 
-        # Calculate fold boundaries
-        val_start = current_fold * fold_size
-        if current_fold == kfold - 1:
-            val_end = n_total
-        else:
-            val_end = val_start + fold_size
-
-        # Split indices
-        val_indices = sorted(shuffled_indices[val_start:val_end])
-        train_indices = sorted(shuffled_indices[:val_start] + shuffled_indices[val_end:])
-        n_train = len(train_indices)
-        n_val = len(val_indices)
+        val_indices = sorted(shuffled_indices[n_train:])
+        train_indices = sorted(shuffled_indices[:n_train])
 
         all_validation_info.append({
             'file_idx': file_idx,
@@ -333,8 +315,7 @@ def export_validation_ids_to_file(config, train_dataset, val_dataset):
             'total_molecules': n_total,
             'train_molecules': n_train,
             'val_molecules': n_val,
-            'kfold': kfold,
-            'current_fold': current_fold,
+            'val_split_ratio': val_split_ratio,
             'split_seed': split_seed,
             'train_indices': train_indices,
             'val_indices': val_indices
@@ -350,18 +331,19 @@ def export_validation_ids_to_file(config, train_dataset, val_dataset):
     summary = {
         'config': {
             'train_folder': config['data']['train_folder'],
-            'kfold': kfold,
-            'current_fold': current_fold,
-            'split_seed': split_seed
+            'val_split_ratio': config['data'].get('val_split_ratio', 0.1),
+            'split_seed': config.get('random_seed', 42)
         },
         'summary': {
             'total_files': len(train_dataset.file_paths),
             'total_train_molecules': total_train_molecules,
             'total_val_molecules': total_val_molecules,
             'validation_behavior': (
-                f"K-fold cross-validation with k={kfold}, using fold {current_fold} for validation. "
-                f"Training uses {kfold-1}/{kfold} of data, validation uses 1/{kfold} of data. "
-                "No train/val overlap (data leakage prevented)."
+                "IMPORTANT: Validation set CHANGES across epochs because each file = 1 epoch. "
+                "The validation split is deterministic for each file (same molecules are always "
+                "in the validation set for a given file), but different files contain different "
+                "molecules. Therefore, epoch 1 uses validation molecules from file 0, epoch 2 "
+                "uses validation molecules from file 1, etc."
             )
         },
         'files': all_validation_info
@@ -484,8 +466,7 @@ def init_wandb(config):
             'use_bond_types': config['model'].get('use_bond_types', True),
             'num_bond_types': config['model'].get('num_bond_types', 4),
             'bond_embedding_dim': config['model'].get('bond_embedding_dim', 8),
-            'kfold': config['data'].get('kfold', 5),
-            'current_fold': config['data'].get('current_fold', 0),
+            'val_split_ratio': config['data'].get('val_split_ratio', 0.0),
             'weight_decay': config['training'].get('weight_decay', 0.001),
             'grad_clip': config['training'].get('grad_clip', 1.0),
             'loss_weights': {

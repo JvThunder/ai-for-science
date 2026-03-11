@@ -4,20 +4,23 @@
 data:
   # Training folder: Directory containing CSV files to cycle through
   # Each file = 1 epoch, model cycles through all files in the folder
-  train_folder: "./data"
+  train_folder: "D:/B3YLP-PM6 Database"
 
-  # K-Fold Cross-Validation for train/val split
-  # Splits data into k folds, uses one fold for validation (no train/val overlap)
-  # Example: kfold=5, current_fold=0 → fold 0 is val (20%), folds 1-4 are train (80%)
-  # Special: current_fold=-1 → train on ALL data, validation is empty/disabled
-  kfold: 5
-  current_fold: -1  # Which fold for validation (0 to kfold-1), or -1 to train on all data
+  # Validation split ratio: Fraction of each file to use for validation (0.0-1.0)
+  # A random val_split_ratio fraction is held out from each training file for validation
+  # For example, 0.1 means 90% train / 10% val split per file
+  val_split_ratio: 0.03
+
+  # Fixed validation set: Keep validation on same file(s) across all epochs
+  # If true, validation uses only the first file and stays fixed
+  # If false, validation cycles through files (each epoch validates on different molecules)
+  use_fixed_validation: false
 
   # Maximum number of bonds per atom (for padding)
-  max_bonds: 7 # use 3 if the dataset is limited to 3 bonds per atom
+  max_bonds: 7
 
   # Batch size for training
-  batch_size: 4
+  batch_size: 512
 
   # Number of dataloader workers for parallel data loading (0 to disable)
   # Recommend: 4-8 for multi-core CPUs
@@ -35,7 +38,7 @@ data:
 
   # Element vocabulary file (txt format, one element per line)
   # If not present, will be created by scanning data files
-  elements_txt: "elements.txt"
+  elements_txt: "config/elements.txt"
 
   # Maximum molecules to scan when creating vocabulary (for speed)
   max_molecules_for_vocab: 100000
@@ -71,7 +74,7 @@ model:
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 100
+  num_epochs: 5
 
   # Resume from checkpoint (set to null or path to checkpoint file)
   # Example: "checkpoints/best_model.pt"
@@ -82,16 +85,16 @@ training:
   resume_from_latest: false
 
   # Learning rate
-  learning_rate: 0.001
+  learning_rate: 0.00001
 
   # L2 weight decay for regularization
-  weight_decay: 0.01
+  weight_decay: 0.002
 
   # Gradient clipping max norm
-  grad_clip: 5.0
+  grad_clip: 1.0
 
   # Early stopping patience (epochs without improvement)
-  early_stopping_patience: 5
+  early_stopping_patience: 200
 
   # Validate every N epochs
   validate_every: 1
@@ -101,22 +104,22 @@ training:
 
   # LR scheduler parameters
   lr_scheduler_params:
-    factor: 0.9      # Reduce LR by this factor
+    factor: 0.7      # Reduce LR by this factor
     patience: 2      # Epochs without improvement before reducing LR
     mode: "min"      # Optimize for minimum loss
 
 # Loss Function Weights
 loss:
   # Weight for distance prediction loss (A-B bond distance)
-  distance_weight: 1.5
+  distance_weight: 1.0
 
   # Weight for angular geometry (θ, Δφ) prediction loss
-  geometry_weight: 1.0
+  geometry_weight: 3.0
 
   # Individual angular geometry component weights (all normalized and equal)
   theta_weight: 1.0     # Polar angle (degrees) [0, 180°]
   phi_weight: 1.0       # Relative azimuthal difference (degrees) [0, 360°]
-  
+
 # Checkpointing
 checkpointing:
   # Directory to save checkpoints
@@ -124,10 +127,10 @@ checkpointing:
 
   # Save checkpoint every N iterations (1 iteration = 1 file)
   # Set to 1 to save after every file, 2 to save every 2 files, etc.
-  save_every_n_iterations: 5
+  save_every_n_iterations: 1
 
   # Keep only N most recent checkpoints
-  keep_last_n: 3
+  keep_last_n: 500
 
 # Logging
 logging:
@@ -142,9 +145,8 @@ logging:
   # Tracking happens incrementally during training (no startup delay)
   export_validation_ids: true
   validation_ids_file: "logs/validation_ids.json"
-
   # Weights & Biases integration
-  use_wandb: true
+  use_wandb: false
   wandb_project: "stereochem-gcn"
   wandb_entity: null  # Set to your wandb username/team (or leave null for default)
   wandb_run_name: null  # Auto-generated if null (e.g., "run-2025-01-15-143022")

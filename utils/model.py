@@ -130,7 +130,7 @@ class LocalGeometryGCN(nn.Module):
             if self.use_bond_types:
                 self.gnn_layers.append(
             GATConv(
-                encoder_input_dim,
+                hidden_dim,
                 hidden_dim,
                 heads=4,
                 concat=False,
