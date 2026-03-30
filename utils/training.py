@@ -96,8 +96,9 @@ def train_epoch(
 
     pbar = tqdm(
         train_loader,
-        desc=f"Epoch {epoch+1} [File {file_idx+1}/{total_files}] Training",
+        desc=f"E{epoch+1} F{file_idx+1}/{total_files} train",
         leave=False,
+        dynamic_ncols=True,
         total=max_batches if max_batches else len(train_loader)
     )
 
@@ -178,8 +179,9 @@ def validate_on_file(
     with torch.no_grad():
         pbar = tqdm(
             val_loader,
-            desc="Validation",
+            desc="val",
             leave=False,
+            dynamic_ncols=True,
             total=max_val_batches if max_val_batches else len(val_loader)
         )
         for batch_idx, data in enumerate(pbar):
@@ -222,7 +224,11 @@ def validate_on_file(
                 mae_angle_sum += angle_stats['mae'] * mask.sum().item()
                 rmse_angle_sum += (angle_stats['rmse'] ** 2) * mask.sum().item()
 
-            pbar.set_postfix({'Val Loss': f"{total_loss/num_batches:.4f}"})
+            pbar.set_postfix({
+                'Loss': f"{total_loss/num_batches:.4f}",
+                'Dist': f"{total_distance_loss/num_batches:.4f}",
+                'Geom': f"{total_geometry_loss/num_batches:.4f}"
+            })
 
     metrics = {
         'total_loss': total_loss / num_batches if num_batches > 0 else 0.0,

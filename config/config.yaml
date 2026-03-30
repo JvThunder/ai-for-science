@@ -11,10 +11,13 @@ data:
   # Example: kfold=5, current_fold=0 → fold 0 is val (20%), folds 1-4 are train (80%)
   # Special: current_fold=-1 → train on ALL data, validation is empty/disabled
   kfold: 5
-  current_fold: -1  # Which fold for validation (0 to kfold-1), or -1 to train on all data
+  current_fold: 1  # Which fold for validation (0 to kfold-1), or -1 to train on all data
 
   # Maximum number of bonds per atom (for padding)
-  max_bonds: 7 # use 3 if the dataset is limited to 3 bonds per atom
+  max_bonds: 3 # use 3 if the dataset is limited to 3 bonds per atom
+
+  # Maximum samples (bonds) to use — set to null to use all data
+  max_samples: 1000
 
   # Batch size for training
   batch_size: 4
@@ -51,12 +54,9 @@ model:
   # Vocabulary size (set automatically from data)
   vocab_size: null
 
-  # Maximum bonds (should match data.max_bonds)
-  max_bonds: 7
-
   # Depth: Number of GAT layers (graph distance from bond being evaluated)
   # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
-  depth: 10
+  depth: 3
 
   # Bond type features: Enable edge features for bond types
   # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
@@ -71,7 +71,7 @@ model:
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 100
+  num_epochs: 10
 
   # Resume from checkpoint (set to null or path to checkpoint file)
   # Example: "checkpoints/best_model.pt"

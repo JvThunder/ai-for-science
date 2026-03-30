@@ -104,7 +104,6 @@ def get_default_config() -> Dict[str, Any]:
             'hidden_dim': 64,
             'embedding_dim': 32,
             'vocab_size': None,  # Set during training from data
-            'max_bonds': 7
         },
         'training': {
             'num_epochs': 50,

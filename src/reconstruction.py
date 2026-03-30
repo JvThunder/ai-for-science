@@ -72,7 +72,7 @@ def load_trained_model(
     model = LocalGeometryGCN(
         num_node_features=vocab_size,
         hidden_dim=config['model']['hidden_dim'],
-        max_bonds=config['model']['max_bonds'],
+        max_bonds=config['data']['max_bonds'],
         vocab_size=vocab_size,
         embedding_dim=config['model']['embedding_dim'],
         depth=config['model'].get('depth', 1),
@@ -95,7 +95,7 @@ def load_trained_model(
     model.eval()
     print(f"Loaded model from {checkpoint_path}")
     print(f"  Vocabulary size: {vocab_size}")
-    print(f"  Max bonds: {config['model']['max_bonds']}")
+    print(f"  Max bonds: {config['data']['max_bonds']}")
 
     return model, element_to_idx, device
 
@@ -2023,7 +2023,7 @@ def reconstruction_demo(
 
     # Load config for max_bonds
     config = load_config(config_path)
-    max_bonds = config['model']['max_bonds']
+    max_bonds = config['data']['max_bonds']
 
     print(f"\n[2] Processing {len(molecule_indices)} molecules from {csv_path}...")
 

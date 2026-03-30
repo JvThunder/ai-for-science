@@ -472,6 +472,8 @@ def create_datasets(config):
         print(f"  Validation: 1/{kfold} of data ({1/kfold*100:.1f}%)")
         print(f"  No train/val overlap (data leakage prevented)")
 
+    max_samples = config['data'].get('max_samples', None)
+
     # Create training dataset
     print("\nCreating training dataset...")
     train_dataset = MultiFileStreamingDataset(
@@ -484,7 +486,8 @@ def create_datasets(config):
         split='train',
         split_seed=split_seed,
         kfold=kfold,
-        current_fold=current_fold
+        current_fold=current_fold,
+        max_samples=max_samples
     )
 
     print(f"Training dataset created:")
@@ -504,7 +507,8 @@ def create_datasets(config):
         split='val',
         split_seed=split_seed,
         kfold=kfold,
-        current_fold=current_fold
+        current_fold=current_fold,
+        max_samples=max_samples
     )
     print(f"Validation dataset created:")
     print(f"  Files: {len(val_dataset.file_paths)}")
@@ -535,7 +539,7 @@ def create_model_with_lora(config, device):
     model = LocalGeometryGCN(
         num_node_features=config['model']['vocab_size'],
         hidden_dim=config['model']['hidden_dim'],
-        max_bonds=config['model']['max_bonds'],
+        max_bonds=config['data']['max_bonds'],
         vocab_size=config['model']['vocab_size'],
         embedding_dim=config['model']['embedding_dim'],
         depth=config['model'].get('depth', 1),
@@ -569,7 +573,7 @@ def create_model_with_lora(config, device):
     print(f"  Hidden dim: {config['model']['hidden_dim']}")
     print(f"  Embedding dim: {config['model']['embedding_dim']}")
     print(f"  Vocabulary size: {config['model']['vocab_size']}")
-    print(f"  Max bonds: {config['model']['max_bonds']}")
+    print(f"  Max bonds: {config['data']['max_bonds']}")
     print(f"  Depth (GAT layers): {config['model'].get('depth', 1)}")
     print(f"  Total base parameters: {base_params:,}")
 
@@ -721,7 +725,7 @@ def init_wandb(config):
             # Model config
             'hidden_dim': config['model']['hidden_dim'],
             'embedding_dim': config['model']['embedding_dim'],
-            'max_bonds': config['model']['max_bonds'],
+            'max_bonds': config['data']['max_bonds'],
             'depth': config['model'].get('depth', 1),
             'use_bond_types': config['model'].get('use_bond_types', True),
 
@@ -758,7 +762,7 @@ def main():
     Main LoRA fine-tuning function.
     """
     # Load configuration
-    config_file = os.environ.get('CONFIG_FILE', 'lora_config.yaml')
+    config_file = os.environ.get('CONFIG_FILE', 'config/lora_config.yaml')
     config = load_config(config_file)
 
     print("\n" + "="*60)

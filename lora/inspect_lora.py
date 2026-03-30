@@ -129,7 +129,7 @@ def main():
     model = LocalGeometryGCN(
         num_node_features=config['model'].get('vocab_size', 70),
         hidden_dim=config['model']['hidden_dim'],
-        max_bonds=config['model']['max_bonds'],
+        max_bonds=config['data']['max_bonds'],
         vocab_size=config['model'].get('vocab_size', 70),
         embedding_dim=config['model']['embedding_dim'],
         depth=config['model'].get('depth', 1),

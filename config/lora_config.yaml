@@ -22,7 +22,7 @@ lora:
     # - "element_embedding"                       # Element embeddings (if vocab changes)
 
   # Pre-trained model to fine-tune
-  pretrained_checkpoint: "models/best_model.pt"  # Path to base model
+  pretrained_checkpoint: "models/final_model.pt"  # Path to base model
 
   # Fine-tuning specific hyperparameters (overrides training section)
   learning_rate: 0.001                            # Learning rate
@@ -40,11 +40,12 @@ data:
 
   # K-fold cross-validation
   kfold: 5                                        # Number of folds
-  current_fold: -1                                # Validation fold (0 to k-1, or -1 to train on all data)
+  current_fold: 1                                 # Validation fold (0 to k-1, or -1 to train on all data)
 
   # Data loading
   batch_size: 4                                   # Batch size
-  max_bonds: 7                                    # Max neighbors per atom
+  max_bonds: 3                                    # Max neighbors per atom
+  max_samples: 1000                               # Maximum samples to use (null = all data)
   chunk_size: 10000                               # Molecules per chunk
   cache_ram_mb: 2048                              # RAM for caching (MB)
   max_molecules_for_vocab: 100000                 # Max molecules for vocab
@@ -55,8 +56,7 @@ data:
 model:
   hidden_dim: 384                                 # GAT hidden dimension
   embedding_dim: 16                               # Element embedding dimension
-  max_bonds: 7                                    # Max neighbors
-  depth: 10                                       # Number of GAT layers
+  depth: 3                                        # Number of GAT layers
 
   # Bond type features
   use_bond_types: true                            # Use bond type embeddings

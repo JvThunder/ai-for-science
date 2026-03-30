@@ -226,7 +226,7 @@ def main():
         bonds_data=bonds,
         element_to_idx=element_vocab,
         device=device,
-        max_bonds=config['model']['max_bonds'],
+        max_bonds=config['data']['max_bonds'],
         start_atom=start_atom
     )
 

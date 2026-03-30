@@ -1217,7 +1217,7 @@ def main():
     model = LocalGeometryGCN(
         num_node_features=vocab_size,
         hidden_dim=config['model']['hidden_dim'],
-        max_bonds=config['model']['max_bonds'],
+        max_bonds=config['data']['max_bonds'],
         vocab_size=vocab_size,
         embedding_dim=config['model']['embedding_dim'],
         depth=config['model'].get('depth', 1),
@@ -1235,7 +1235,7 @@ def main():
     model.eval()
     print(f"Loaded model from {checkpoint_path}")
 
-    max_bonds = config['model']['max_bonds']
+    max_bonds = config['data']['max_bonds']
 
     # Create polyethylene graph
     print("\n[2] Creating polyethylene bond graph...")
