@@ -508,7 +508,7 @@ def main():
     Main training function.
     """
     # Load configuration (from environment variable or default)
-    config_file = os.environ.get('CONFIG_FILE', 'config.yaml')
+    config_file = os.environ.get('CONFIG_FILE', 'config/config.yaml')
     config = load_config(config_file)
 
     print("\n" + "="*60)

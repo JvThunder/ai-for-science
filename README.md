@@ -58,16 +58,7 @@ This project was developed and tested with the following package versions:
 ```bash
 # Install PyTorch with CUDA 11.8 support
 pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu118
-
-# Install PyTorch Geometric and extensions
-pip install torch-geometric==2.6.1
-pip install torch-scatter==2.1.2 torch-sparse==0.6.18 torch-cluster==1.6.3 torch-spline-conv==1.2.2 --find-links https://data.pyg.org/whl/torch-2.7.0+cu118.html
-
-# Install remaining dependencies
-pip install pandas==2.2.3 numpy==1.26.4 pyyaml==6.0.2 tqdm==4.67.1 matplotlib==3.10.1 scikit-learn==1.7.0
-
-# Optional: Weights & Biases for experiment tracking
-pip install wandb==0.21.1
+pip install -e .
 ```
 
 **Option 2: Using requirements.txt**

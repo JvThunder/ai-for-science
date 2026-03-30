@@ -29,7 +29,7 @@ import io
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.model import LocalGeometryGCN
-from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, get_element_vocab, dfs_subgraph
+from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, parse_pubchem_data, _pubchem_mapping_has_error, get_element_vocab, dfs_subgraph
 from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
 from utils.config import load_config
 from utils.loss import total_loss, percentage_loss, geometry_loss
@@ -119,21 +119,37 @@ def load_molecule_from_csv(
     """
     df = pd.read_csv(csv_path)
 
-    # Find valid molecules (with bonding_status="OK")
+    # Find valid molecules (geometry_xyz always required for 3D coords)
     valid_rows = []
     for idx, row in df.iterrows():
-        if row.get('bonding_status') == 'OK':
-            if 'geometry_xyz' in row and not pd.isna(row['geometry_xyz']):
-                if 'bonds_geom_valence' in row and not pd.isna(row['bonds_geom_valence']):
-                    valid_rows.append((idx, row))
+        if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
+            continue
+        use_pubchem = (
+            'Pubchem_to_xyz_aid_mapping' in row
+            and not _pubchem_mapping_has_error(row.get('Pubchem_to_xyz_aid_mapping'))
+        )
+        if use_pubchem:
+            valid_rows.append((idx, row, True))
+        elif row.get('bonding_status') == 'OK' and not pd.isna(row.get('bonds_geom_valence', float('nan'))):
+            valid_rows.append((idx, row, False))
 
     if molecule_idx >= len(valid_rows):
         raise IndexError(f"Molecule index {molecule_idx} out of range (only {len(valid_rows)} valid molecules)")
 
-    idx, row = valid_rows[molecule_idx]
+    idx, row, use_pubchem = valid_rows[molecule_idx]
 
-    coordinates, elements = parse_xyz_string(row['geometry_xyz'])
-    bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+    xyz_coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
+
+    if use_pubchem:
+        coordinates, elements, bonds_data = parse_pubchem_data(row, xyz_coordinates)
+        if not coordinates or not bonds_data:
+            # Fallback if PubChem parsing failed
+            coordinates, elements = xyz_coordinates, xyz_elements
+            bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+    else:
+        coordinates, elements = xyz_coordinates, xyz_elements
+        bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+
     cid = row.get('cid', f'molecule_{idx}')
 
     return coordinates, elements, bonds_data, cid

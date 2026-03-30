@@ -39,6 +39,113 @@ import psutil
 sys.path.append(os.path.dirname(__file__))
 from geometry import compute_local_geometry, convert_to_relative_azimuthal, get_neighbor_sort_keys
 
+# Periodic table: atomic number → element symbol (covers common chemistry elements)
+ATOMIC_NUM_TO_SYMBOL: Dict[int, str] = {
+    1: 'H', 2: 'He', 3: 'Li', 4: 'Be', 5: 'B', 6: 'C', 7: 'N', 8: 'O',
+    9: 'F', 10: 'Ne', 11: 'Na', 12: 'Mg', 13: 'Al', 14: 'Si', 15: 'P',
+    16: 'S', 17: 'Cl', 18: 'Ar', 19: 'K', 20: 'Ca', 21: 'Sc', 22: 'Ti',
+    23: 'V', 24: 'Cr', 25: 'Mn', 26: 'Fe', 27: 'Co', 28: 'Ni', 29: 'Cu',
+    30: 'Zn', 31: 'Ga', 32: 'Ge', 33: 'As', 34: 'Se', 35: 'Br', 36: 'Kr',
+    37: 'Rb', 38: 'Sr', 39: 'Y', 40: 'Zr', 41: 'Nb', 42: 'Mo', 43: 'Tc',
+    44: 'Ru', 45: 'Rh', 46: 'Pd', 47: 'Ag', 48: 'Cd', 49: 'In', 50: 'Sn',
+    51: 'Sb', 52: 'Te', 53: 'I', 54: 'Xe', 55: 'Cs', 56: 'Ba', 57: 'La',
+    72: 'Hf', 73: 'Ta', 74: 'W', 75: 'Re', 76: 'Os', 77: 'Ir', 78: 'Pt',
+    79: 'Au', 80: 'Hg', 81: 'Tl', 82: 'Pb', 83: 'Bi', 84: 'Po', 85: 'At',
+    86: 'Rn',
+}
+
+
+def _pubchem_mapping_has_error(mapping_val) -> bool:
+    """Return True if Pubchem_to_xyz_aid_mapping contains the word 'error' (case-insensitive)."""
+    if mapping_val is None:
+        return True
+    try:
+        if pd.isna(mapping_val):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return 'error' in str(mapping_val).lower()
+
+
+def _parse_json_list(value):
+    """Parse a JSON-encoded list column, returning the list or None on failure."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, list):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def parse_pubchem_data(row, xyz_coordinates: List[List[float]]) -> Tuple[List[List[float]], List[str], List[Dict]]:
+    """
+    Parse PubChem columns to produce coordinates (from XYZ mapped via aid mapping),
+    element symbols, and bond dicts compatible with the existing processing pipeline.
+
+    Args:
+        row: DataFrame row with PubChem columns
+        xyz_coordinates: 3D coordinates already parsed from geometry_xyz
+
+    Returns:
+        coordinates: List of [x, y, z] in PubChem atom ordering (mapped from XYZ)
+        elements: List of element symbols in PubChem atom ordering
+        bonds: List of {'i': int, 'j': int, 'order': float} (0-indexed positions)
+    """
+    aids = _parse_json_list(row['atoms.aid_pubchem'])
+    atomic_nums = _parse_json_list(row['atoms.element_pubchem'])
+    mapping = _parse_json_list(row['Pubchem_to_xyz_aid_mapping'])
+
+    if aids is None or atomic_nums is None or mapping is None:
+        return [], [], []
+    if len(aids) != len(atomic_nums) or len(mapping) != len(aids):
+        return [], [], []
+
+    # Convert atomic numbers to element symbols
+    elements = [ATOMIC_NUM_TO_SYMBOL.get(int(z), 'OTHER') for z in atomic_nums]
+
+    # Map 3D coordinates from XYZ ordering to PubChem ordering
+    # mapping[i] = XYZ atom ID (1-indexed) for PubChem atom at position i
+    n = len(aids)
+    coordinates = []
+    for i in range(n):
+        xyz_idx = int(mapping[i]) - 1  # Convert to 0-indexed
+        if 0 <= xyz_idx < len(xyz_coordinates):
+            coordinates.append(xyz_coordinates[xyz_idx])
+        else:
+            return [], [], []  # Mapping out of range — abort
+
+    # Build AID → position mapping for bond index lookup
+    aid_to_pos = {int(aid): pos for pos, aid in enumerate(aids)}
+
+    # Parse bond lists
+    aid1_list = _parse_json_list(row['bonds.aid1_pubchem'])
+    aid2_list = _parse_json_list(row['bonds.aid2_pubchem'])
+    order_list = _parse_json_list(row['bonds.order_pubchem'])
+
+    if aid1_list is None or aid2_list is None or order_list is None:
+        return coordinates, elements, []
+
+    bonds = []
+    for aid1, aid2, order in zip(aid1_list, aid2_list, order_list):
+        i = aid_to_pos.get(int(aid1))
+        j = aid_to_pos.get(int(aid2))
+        if i is None or j is None or i == j:
+            continue
+        # PubChem bond orders: 1=single, 2=double, 3=triple, 4=aromatic
+        bond_order = float(order)
+        if bond_order == 4.0:
+            bond_order = 1.5  # Aromatic
+        bonds.append({'i': i, 'j': j, 'order': bond_order})
+
+    return coordinates, elements, bonds
+
 
 def parse_xyz_string(xyz_string: str) -> Tuple[List[List[float]], List[str]]:
     """
@@ -350,42 +457,54 @@ class MultiFileStreamingDataset(Dataset):
         for chunk in pd.read_csv(self.current_file, chunksize=self.chunk_size):
             for row_in_chunk, (_, row) in enumerate(chunk.iterrows()):
                 try:
-                    # Quick validation
+                    # Always need geometry_xyz for 3D coordinates
                     if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
                         continue
-                    if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
-                        continue
 
-                    # Filter: Only use molecules with bonding_status="OK" AND bonding_issues_atoms=[]
-                    if row['bonding_status'] != 'OK':
-                        continue
+                    # Determine whether to use PubChem columns
+                    use_pubchem = (
+                        'Pubchem_to_xyz_aid_mapping' in row
+                        and not _pubchem_mapping_has_error(row['Pubchem_to_xyz_aid_mapping'])
+                    )
 
-                    # Check bonding_issues_atoms is empty list (it's a JSON string, not a list)
-                    if 'bonding_issues_atoms' in row and not pd.isna(row['bonding_issues_atoms']):
-                        issues_str = row['bonding_issues_atoms']
-                        # Parse JSON string to list
-                        try:
-                            if isinstance(issues_str, str):
-                                issues_list = json.loads(issues_str)
-                            else:
-                                issues_list = issues_str
-                            # Skip if there are any bonding issues
-                            if issues_list and len(issues_list) > 0:
-                                continue
-                        except (json.JSONDecodeError, TypeError):
-                            # If we can't parse it, skip this molecule to be safe
-                            continue
-
-                    # Parse to validate
-                    coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+                    # Parse 3D coordinates from XYZ (always needed)
+                    coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
                     if not coordinates or len(coordinates) < 2:
                         continue
 
-                    bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
-                    if not bonds_data:
-                        continue
+                    if use_pubchem:
+                        # Use PubChem atoms and bonds
+                        coordinates, elements, bonds_data = parse_pubchem_data(row, coordinates)
+                        if not coordinates or not bonds_data:
+                            continue
+                    else:
+                        # Fall back to DFT geometry columns
+                        if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
+                            continue
 
-                    # Count bonds
+                        # Filter: Only use molecules with bonding_status="OK" AND bonding_issues_atoms=[]
+                        if row['bonding_status'] != 'OK':
+                            continue
+
+                        # Check bonding_issues_atoms is empty list
+                        if 'bonding_issues_atoms' in row and not pd.isna(row['bonding_issues_atoms']):
+                            issues_str = row['bonding_issues_atoms']
+                            try:
+                                if isinstance(issues_str, str):
+                                    issues_list = json.loads(issues_str)
+                                else:
+                                    issues_list = issues_str
+                                if issues_list and len(issues_list) > 0:
+                                    continue
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+
+                        elements = xyz_elements
+                        bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+                        if not bonds_data:
+                            continue
+
+                    # Count valid bonds
                     bond_count = 0
                     for bond in bonds_data:
                         if 'i' in bond and 'j' in bond:
@@ -626,9 +745,24 @@ class MultiFileStreamingDataset(Dataset):
             3. Bond types: Preserved via edge_attr for all edges in subgraph
             4. Scalability: Memory-efficient for large molecules (only local context extracted)
         """
-        # Parse XYZ and bonds
-        coordinates, elements = parse_xyz_string(row['geometry_xyz'])
-        bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+        # Parse 3D coordinates from XYZ (always needed for geometry)
+        xyz_coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
+
+        # Determine whether to use PubChem columns
+        use_pubchem = (
+            'Pubchem_to_xyz_aid_mapping' in row
+            and not _pubchem_mapping_has_error(row.get('Pubchem_to_xyz_aid_mapping'))
+        )
+
+        if use_pubchem:
+            coordinates, elements, bonds_data = parse_pubchem_data(row, xyz_coordinates)
+            # If PubChem parsing failed for any reason, fall back
+            if not coordinates or not bonds_data:
+                coordinates, elements = xyz_coordinates, xyz_elements
+                bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
+        else:
+            coordinates, elements = xyz_coordinates, xyz_elements
+            bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
 
         # Filter valid elements
         valid_indices = [i for i, elem in enumerate(elements) if elem.strip()]
