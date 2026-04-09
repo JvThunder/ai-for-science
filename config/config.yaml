@@ -17,10 +17,10 @@ data:
   max_bonds: 3 # use 3 if the dataset is limited to 3 bonds per atom
 
   # Maximum samples (bonds) to use — set to null to use all data
-  max_samples: 1000
+  # max_samples: 10000
 
   # Batch size for training
-  batch_size: 4
+  batch_size: 512
 
   # Number of dataloader workers for parallel data loading (0 to disable)
   # Recommend: 4-8 for multi-core CPUs
@@ -46,17 +46,17 @@ data:
 # Model Architecture
 model:
   # Hidden dimension for GAT layers
-  hidden_dim: 384
+  hidden_dim: 32
 
   # Element embedding dimension
-  embedding_dim: 16
+  embedding_dim: 32
 
   # Vocabulary size (set automatically from data)
   vocab_size: null
 
   # Depth: Number of GAT layers (graph distance from bond being evaluated)
   # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
-  depth: 3
+  depth: 5
 
   # Bond type features: Enable edge features for bond types
   # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
@@ -66,12 +66,12 @@ model:
   num_bond_types: 4
 
   # Bond type embedding dimension
-  bond_embedding_dim: 8
+  bond_embedding_dim: 32
 
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 10
+  num_epochs: 1
 
   # Resume from checkpoint (set to null or path to checkpoint file)
   # Example: "checkpoints/best_model.pt"
@@ -154,7 +154,7 @@ logging:
 # Hardware
 hardware:
   # Device: 'cuda', 'cpu', or 'auto' (auto-detect)
-  device: "cuda"
+  device: "auto"
 
   # Enable mixed precision training (if supported)
   mixed_precision: false

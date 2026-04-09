@@ -125,8 +125,11 @@ class LocalGeometryGCN(nn.Module):
             )
             self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.5)
+        # Residual projection for first layer (if input dim != hidden dim)
+        self.input_proj = nn.Linear(encoder_input_dim, hidden_dim) if encoder_input_dim != hidden_dim else nn.Identity()
+
+        # Dropout for regularization (reduced from 0.5 — residuals already regularize)
+        self.dropout = nn.Dropout(0.3)
 
         # Distance prediction head (A-B distance)
         # Input: concatenated embeddings of A and B
@@ -147,12 +150,15 @@ class LocalGeometryGCN(nn.Module):
         #        First neighbor: Δφ=0 (by definition)
         #        Other neighbors: angle difference from previous neighbor
         #
-        # NOTE: We output raw values and apply activations in forward pass
-        # to allow separate handling of each geometry component
+        # Deeper head (3 layers) to better decode node embeddings into geometry.
+        # Raw values are clamped in forward pass (avoids sigmoid saturation near extremes).
         self.geometry_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.4),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim // 2, max_bonds * 2)  # Output (θ, Δφ) only, no r
         )
 
@@ -175,8 +181,8 @@ class LocalGeometryGCN(nn.Module):
 
         Output activations:
             - distance: softplus (positive values)
-            - θ: sigmoid * 180 (range [0, 180] degrees)
-            - Δφ: sigmoid * 360 (range [0, 360] degrees for angular differences)
+            - θ: sigmoid * 180 → (0, 180) degrees
+            - Δφ: sigmoid * 360 → (0, 360) degrees
         """
         x, edge_index = data.x, data.edge_index
         node_a, node_b = data.node_a, data.node_b
@@ -193,19 +199,24 @@ class LocalGeometryGCN(nn.Module):
         else:
             edge_features = None
 
-        # GNN encoding with batch normalization and dropout (loop through all layers)
+        # GNN encoding with batch normalization, dropout, and residual connections.
         # Each GATConv receives bond embeddings as edge_attr so attention scores
         # for edge (i→j) condition directly on that edge's bond type.
-        for gnn_layer, bn_layer in zip(self.gnn_layers, self.batch_norms):
+        # Residual connections prevent over-smoothing across layers.
+        for i, (gnn_layer, bn_layer) in enumerate(zip(self.gnn_layers, self.batch_norms)):
             if self.use_bond_types and edge_features is not None:
-                x = gnn_layer(x, edge_index, edge_attr=edge_features)
+                h = gnn_layer(x, edge_index, edge_attr=edge_features)
             else:
-                x = gnn_layer(x, edge_index)
+                h = gnn_layer(x, edge_index)
 
-            x = F.relu(x)
-            if x.size(0) > 1:  # Skip batch norm if batch size == 1
-                x = bn_layer(x)
-            x = self.dropout(x)
+            h = F.relu(h)
+            if h.size(0) > 1:  # Skip batch norm if batch size == 1
+                h = bn_layer(h)
+            h = self.dropout(h)
+
+            # Residual: project input on first layer, direct add thereafter
+            residual = self.input_proj(x) if i == 0 else x
+            x = h + residual
 
         # Extract embeddings for target nodes A and B
         # Handle batched vs. single graph indexing
@@ -238,9 +249,9 @@ class LocalGeometryGCN(nn.Module):
         geom_a_raw = self.geometry_head(emb_a)  # (batch_size, max_bonds * 2)
         geom_a_raw = geom_a_raw.view(-1, self.max_bonds, 2)  # (batch_size, max_bonds, 2)
 
-        # Apply activations for (θ, Δφ)
-        theta_a = torch.sigmoid(geom_a_raw[:, :, 0:1]) * 180.0  # (batch_size, max_bonds, 1) - [0, 180] degrees
-        delta_phi_a = torch.sigmoid(geom_a_raw[:, :, 1:2]) * 360.0  # (batch_size, max_bonds, 1) - [0, 360] degrees
+        # Sigmoid scaling — gradient flows everywhere (no dead zones unlike clamp)
+        theta_a = torch.sigmoid(geom_a_raw[:, :, 0:1]) * 180.0      # (0, 180) degrees
+        delta_phi_a = torch.sigmoid(geom_a_raw[:, :, 1:2]) * 360.0  # (0, 360) degrees
 
         geometry_a = torch.cat([theta_a, delta_phi_a], dim=-1)  # (batch_size, max_bonds, 2)
 
@@ -248,9 +259,9 @@ class LocalGeometryGCN(nn.Module):
         geom_b_raw = self.geometry_head(emb_b)  # (batch_size, max_bonds * 2)
         geom_b_raw = geom_b_raw.view(-1, self.max_bonds, 2)  # (batch_size, max_bonds, 2)
 
-        # Apply activations for (θ, Δφ)
-        theta_b = torch.sigmoid(geom_b_raw[:, :, 0:1]) * 180.0  # (batch_size, max_bonds, 1) - [0, 180] degrees
-        delta_phi_b = torch.sigmoid(geom_b_raw[:, :, 1:2]) * 360.0  # (batch_size, max_bonds, 1) - [0, 360] degrees
+        # Sigmoid scaling
+        theta_b = torch.sigmoid(geom_b_raw[:, :, 0:1]) * 180.0      # (0, 180) degrees
+        delta_phi_b = torch.sigmoid(geom_b_raw[:, :, 1:2]) * 360.0  # (0, 360) degrees
 
         geometry_b = torch.cat([theta_b, delta_phi_b], dim=-1)  # (batch_size, max_bonds, 2)
 
