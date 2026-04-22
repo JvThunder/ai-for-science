@@ -4,7 +4,7 @@
 data:
   # Training folder: Directory containing CSV files to cycle through
   # Each file = 1 epoch, model cycles through all files in the folder
-  train_folder: "./data"
+  train_folder: "D:/B3YLP-PM6 Database"
 
   # K-Fold Cross-Validation for train/val split
   # Splits data into k folds, uses one fold for validation (no train/val overlap)
@@ -14,13 +14,13 @@ data:
   current_fold: 1  # Which fold for validation (0 to kfold-1), or -1 to train on all data
 
   # Maximum number of bonds per atom (for padding)
-  max_bonds: 3 # use 3 if the dataset is limited to 3 bonds per atom
+  max_bonds: 7 # use 3 if the dataset is limited to 3 bonds per atom
 
   # Maximum samples (bonds) to use — set to null to use all data
-  max_samples: 1000
+  # max_samples: 1000
 
   # Batch size for training
-  batch_size: 4
+  batch_size: 512
 
   # Number of dataloader workers for parallel data loading (0 to disable)
   # Recommend: 4-8 for multi-core CPUs
@@ -56,7 +56,7 @@ model:
 
   # Depth: Number of GAT layers (graph distance from bond being evaluated)
   # depth=1: 1 GAT layer, depth=2: 2 layers, depth=3: 3 layers, etc.
-  depth: 3
+  depth: 10
 
   # Bond type features: Enable edge features for bond types
   # Distinguishes single (0), aromatic (1), double (2), and triple (3) bonds
@@ -71,7 +71,7 @@ model:
 # Training Configuration
 training:
   # Number of cycles through all files
-  num_epochs: 10
+  num_epochs: 5
 
   # Resume from checkpoint (set to null or path to checkpoint file)
   # Example: "checkpoints/best_model.pt"
@@ -85,13 +85,13 @@ training:
   learning_rate: 0.001
 
   # L2 weight decay for regularization
-  weight_decay: 0.01
+  weight_decay: 0.002
 
   # Gradient clipping max norm
-  grad_clip: 5.0
+  grad_clip: 1.0
 
   # Early stopping patience (epochs without improvement)
-  early_stopping_patience: 5
+  early_stopping_patience: 80
 
   # Validate every N epochs
   validate_every: 1
@@ -101,14 +101,14 @@ training:
 
   # LR scheduler parameters
   lr_scheduler_params:
-    factor: 0.9      # Reduce LR by this factor
+    factor: 0.7      # Reduce LR by this factor
     patience: 2      # Epochs without improvement before reducing LR
     mode: "min"      # Optimize for minimum loss
 
 # Loss Function Weights
 loss:
   # Weight for distance prediction loss (A-B bond distance)
-  distance_weight: 1.5
+  distance_weight: 1.0
 
   # Weight for angular geometry (θ, Δφ) prediction loss
   geometry_weight: 1.0
@@ -124,10 +124,10 @@ checkpointing:
 
   # Save checkpoint every N iterations (1 iteration = 1 file)
   # Set to 1 to save after every file, 2 to save every 2 files, etc.
-  save_every_n_iterations: 5
+  save_every_n_iterations: 1
 
   # Keep only N most recent checkpoints
-  keep_last_n: 3
+  keep_last_n: 500
 
 # Logging
 logging:
@@ -144,7 +144,7 @@ logging:
   validation_ids_file: "logs/validation_ids.json"
 
   # Weights & Biases integration
-  use_wandb: true
+  use_wandb: false
   wandb_project: "stereochem-gcn"
   wandb_entity: null  # Set to your wandb username/team (or leave null for default)
   wandb_run_name: null  # Auto-generated if null (e.g., "run-2025-01-15-143022")
