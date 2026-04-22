@@ -445,8 +445,8 @@ class MultiFileStreamingDataset(Dataset):
         """
         Load metadata for current file (molecule counts, bond counts).
 
-        Does NOT load actual molecule data - only counts for indexing.
-        Memory usage: O(num_molecules) not O(num_atoms * num_molecules)
+        Only uses PubChem columns.
+        Skips any row that does not have valid PubChem mapping/data.
         """
         print(f"\nLoading metadata from: {self.current_file}")
 
@@ -461,48 +461,23 @@ class MultiFileStreamingDataset(Dataset):
                     if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
                         continue
 
-                    # Determine whether to use PubChem columns
-                    use_pubchem = (
-                        'Pubchem_to_xyz_aid_mapping' in row
-                        and not _pubchem_mapping_has_error(row['Pubchem_to_xyz_aid_mapping'])
-                    )
+                    # Require valid PubChem mapping
+                    if (
+                        'Pubchem_to_xyz_aid_mapping' not in row
+                        or pd.isna(row['Pubchem_to_xyz_aid_mapping'])
+                        or _pubchem_mapping_has_error(row['Pubchem_to_xyz_aid_mapping'])
+                    ):
+                        continue
 
-                    # Parse 3D coordinates from XYZ (always needed)
+                    # Parse 3D coordinates from XYZ
                     coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
                     if not coordinates or len(coordinates) < 2:
                         continue
 
-                    if use_pubchem:
-                        # Use PubChem atoms and bonds
-                        coordinates, elements, bonds_data = parse_pubchem_data(row, coordinates)
-                        if not coordinates or not bonds_data:
-                            continue
-                    else:
-                        # Fall back to DFT geometry columns
-                        if 'bonds_geom_valence' not in row or pd.isna(row['bonds_geom_valence']):
-                            continue
-
-                        # Filter: Only use molecules with bonding_status="OK" AND bonding_issues_atoms=[]
-                        if row['bonding_status'] != 'OK':
-                            continue
-
-                        # Check bonding_issues_atoms is empty list
-                        if 'bonding_issues_atoms' in row and not pd.isna(row['bonding_issues_atoms']):
-                            issues_str = row['bonding_issues_atoms']
-                            try:
-                                if isinstance(issues_str, str):
-                                    issues_list = json.loads(issues_str)
-                                else:
-                                    issues_list = issues_str
-                                if issues_list and len(issues_list) > 0:
-                                    continue
-                            except (json.JSONDecodeError, TypeError):
-                                continue
-
-                        elements = xyz_elements
-                        bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
-                        if not bonds_data:
-                            continue
+                    # Use PubChem atoms and bonds only
+                    coordinates, elements, bonds_data = parse_pubchem_data(row, coordinates)
+                    if not coordinates or not bonds_data:
+                        continue
 
                     # Count valid bonds
                     bond_count = 0
@@ -514,7 +489,6 @@ class MultiFileStreamingDataset(Dataset):
 
                     # Add non-bonded pairs count if requested
                     if self.include_non_bonded and bond_count > 0:
-                        # Estimate non-bonded pairs (will sample 1/3 of bonds)
                         bond_count += bond_count // 3
 
                     if bond_count > 0:
