@@ -6,18 +6,14 @@ This script helps you understand which layers in your model will have LoRA appli
 It prints the model structure and shows which modules match your target patterns.
 
 Usage:
-    python inspect_lora.py
-    python inspect_lora.py --config lora_config.yaml
+    uv run python -m src.lora.inspect_lora
+    uv run python -m src.lora.inspect_lora --config config/lora_config.yaml
 """
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-from utils.config import load_config
-from utils.model import LocalGeometryGCN
+from src.utils.config import load_config
+from src.utils.model import LocalGeometryGCN
 import argparse
 
 

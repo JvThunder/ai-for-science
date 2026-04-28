@@ -12,9 +12,7 @@ import argparse
 from typing import List, Dict
 
 # Import from reconstruction module
-import sys
-sys.path.insert(0, 'src')
-from reconstruction.reconstruction import load_trained_model, reconstruct_from_center
+from src.reconstruction.reconstruction import load_trained_model, reconstruct_from_center
 
 
 def create_polyethylene_chain(n_carbons: int) -> tuple:

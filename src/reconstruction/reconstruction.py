@@ -6,7 +6,7 @@ This script loads a trained LocalGeometryGCN model and reconstructs 3D molecular
 geometries from the predicted local spherical coordinates (r, theta, delta_phi).
 
 Usage:
-    python reconstruction.py
+    uv run python -m src.reconstruction.reconstruction
 """
 
 import torch
@@ -26,13 +26,11 @@ import imageio
 import io
 
 # Import utilities from the project
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from utils.model import LocalGeometryGCN
-from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, parse_pubchem_data, _pubchem_mapping_has_error, get_element_vocab, dfs_subgraph
-from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
-from utils.config import load_config
-from utils.loss import total_loss, percentage_loss, geometry_loss
+from src.utils.model import LocalGeometryGCN
+from src.utils.dataset import parse_xyz_string, parse_bonds_from_dataset, parse_pubchem_data, _pubchem_mapping_has_error, get_element_vocab, dfs_subgraph
+from src.utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
+from src.utils.config import load_config
+from src.utils.loss import total_loss, percentage_loss, geometry_loss
 
 
 def load_trained_model(

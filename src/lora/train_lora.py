@@ -22,7 +22,7 @@ LoRA Configuration:
 
 Usage:
     # Fine-tune with lora_config.yaml
-    uv run python lora/train_lora.py
+    uv run python -m src.lora.train_lora
 
     # Configure LoRA settings in config YAML:
     # lora:
@@ -61,12 +61,12 @@ except ImportError:
     wandb = None
 
 # Import utilities
-from utils.config import load_config, validate_config, print_config
-from utils.model import LocalGeometryGCN, count_parameters, initialize_weights
-from utils.dataset import MultiFileStreamingDataset, get_element_vocab
-from utils.training import train_multi_file
-from utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
-from utils.metrics import MetricsLogger
+from src.utils.config import load_config, validate_config, print_config
+from src.utils.model import LocalGeometryGCN, count_parameters, initialize_weights
+from src.utils.dataset import MultiFileStreamingDataset, get_element_vocab
+from src.train.train_loop import train_multi_file
+from src.utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
+from src.utils.metrics import MetricsLogger
 import json
 
 import warnings

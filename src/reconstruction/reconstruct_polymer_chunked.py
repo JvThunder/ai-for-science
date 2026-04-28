@@ -22,9 +22,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 # Import from reconstruction module
-import sys
-sys.path.insert(0, 'src')
-from reconstruction.reconstruction import (
+from src.reconstruction.reconstruction import (
     load_trained_model,
     reconstruct_from_center,
     align_molecules,

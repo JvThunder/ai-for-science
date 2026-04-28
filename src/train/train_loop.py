@@ -24,7 +24,7 @@ from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
 import time
 
-from .loss import total_loss, compute_angle_errors
+from ..utils.loss import total_loss, compute_angle_errors
 import json
 from pathlib import Path
 
@@ -279,7 +279,7 @@ def _get_validation_info_for_current_file(train_dataset, val_dataset, file_idx, 
 
     import pandas as pd
     import random as rand
-    from .dataset import parse_xyz_string, parse_bonds_from_dataset
+    from ..utils.dataset import parse_xyz_string, parse_bonds_from_dataset
 
     # Read file to get original indices
     df = pd.read_csv(current_file)
