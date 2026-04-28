@@ -19,6 +19,17 @@ GAT-based model that predicts local molecular geometry in spherical coordinates 
 `-- pyproject.toml
 ```
 
+## Table of Contents
+
+- [Project Layout](#project-layout)
+- [Setup With uv](#setup-with-uv)
+- [Running The Project](#running-the-project)
+- [Data](#data)
+- [Training](#training)
+- [Reconstruction](#reconstruction)
+- [Visualisation](#visualisation)
+- [LoRA Fine-Tuning](#lora-fine-tuning)
+
 ## Setup With uv
 
 1. Install `uv` if it is not already on your machine.
@@ -107,6 +118,38 @@ training:
 
 Checkpoints are saved to `checkpoints/`, logs to `logs/`.
 Enable Weights & Biases with `logging.use_wandb: true` and `wandb login`.
+
+## Reconstruction
+
+```bash
+# Linux/macOS
+./scripts/reconstruct.sh
+
+# Windows
+scripts\reconstruct.bat
+
+# Or Python directly
+uv run python -m src.reconstruction.reconstruction
+```
+
+Requires a trained checkpoint at `checkpoints/best_model.pt`. Edit the `__main__` block to set `csv_path` and `molecule_indices`.
+
+## Visualisation
+
+Visualise the nth row of a CSV as an interactive 3D HTML:
+
+```bash
+# Row 0 (default)
+uv run python src/visualize_molecule.py
+
+# Specific row
+uv run python src/visualize_molecule.py --row 5
+
+# Custom CSV and output
+uv run python src/visualize_molecule.py --row 2 --csv path/to/file.csv --out mol.html
+```
+
+Opens automatically in the browser. Atoms are coloured by element (CPK), bonds styled by order (solid=single, dashed=double, dotted=aromatic).
 
 ## LoRA Fine-Tuning
 
@@ -499,34 +542,3 @@ lora:
 6. **Use W&B or tensorboard**: Track experiments to find optimal hyperparameters
 7. **Validate on held-out data**: Ensure improvements generalize
 
-## Reconstruction
-
-```bash
-# Linux/macOS
-./scripts/reconstruct.sh
-
-# Windows
-scripts\reconstruct.bat
-
-# Or Python directly
-uv run python -m src.reconstruction.reconstruction
-```
-
-Requires a trained checkpoint at `checkpoints/best_model.pt`. Edit the `__main__` block to set `csv_path` and `molecule_indices`.
-
-## Visualisation
-
-Visualise the nth row of a CSV as an interactive 3D HTML:
-
-```bash
-# Row 0 (default)
-uv run python src/visualize_molecule.py
-
-# Specific row
-uv run python src/visualize_molecule.py --row 5
-
-# Custom CSV and output
-uv run python src/visualize_molecule.py --row 2 --csv path/to/file.csv --out mol.html
-```
-
-Opens automatically in the browser. Atoms are coloured by element (CPK), bonds styled by order (solid=single, dashed=double, dotted=aromatic).
