@@ -39,7 +39,7 @@ First, train a base model using the standard training script:
 
 ```bash
 # Train base model
-python local_geometry_gcn_stereo.py
+uv run python src/train_model.py
 
 # This will save: models/final_model.pt
 ```
@@ -67,10 +67,10 @@ lora:
 
 ```bash
 # Fine-tune with LoRA
-python local_geometry_gcn_stereo_lora.py
+uv run python lora/train_lora.py
 
 # Or specify custom config
-CONFIG_FILE=my_lora_config.yaml python local_geometry_gcn_stereo_lora.py
+CONFIG_FILE=my_lora_config.yaml uv run python lora/train_lora.py
 ```
 
 ### 4. Use Fine-Tuned Model
@@ -267,7 +267,7 @@ training:
 ### Merge LoRA Weights for Inference
 
 ```python
-from local_geometry_gcn_stereo_lora import merge_lora_weights
+from lora.train_lora import merge_lora_weights
 
 # Load LoRA model
 model_with_lora = torch.load("models/final_lora_model.pt")
@@ -285,13 +285,13 @@ Train different adapters for different tasks:
 
 ```bash
 # Train adapter 1: Drug molecules
-CONFIG_FILE=lora_drug.yaml python local_geometry_gcn_stereo_lora.py
+CONFIG_FILE=lora_drug.yaml uv run python lora/train_lora.py
 
 # Train adapter 2: Polymers
-CONFIG_FILE=lora_polymer.yaml python local_geometry_gcn_stereo_lora.py
+CONFIG_FILE=lora_polymer.yaml uv run python lora/train_lora.py
 
 # Train adapter 3: Organometallics
-CONFIG_FILE=lora_organometallic.yaml python local_geometry_gcn_stereo_lora.py
+CONFIG_FILE=lora_organometallic.yaml uv run python lora/train_lora.py
 ```
 
 Load the appropriate adapter at inference time.
@@ -409,10 +409,10 @@ For issues or questions:
 
 ## Next Steps
 
-1. Train a base model with `local_geometry_gcn_stereo.py`
+1. Train a base model with `uv run python src/train_model.py`
 2. Prepare your fine-tuning dataset
 3. Configure `lora_config.yaml`
-4. Run `local_geometry_gcn_stereo_lora.py`
+4. Run `uv run python lora/train_lora.py`
 5. Evaluate the fine-tuned model
 6. Use merged model for inference
 

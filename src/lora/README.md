@@ -5,7 +5,7 @@ This folder contains all files needed for LoRA (Low-Rank Adaptation) fine-tuning
 ## Contents
 
 ### Scripts
-- **`local_geometry_gcn_stereo_lora.py`** - Main LoRA training script
+- **`train_lora.py`** - Main LoRA training script
 - **`lora_utils.py`** - Utility tools for managing LoRA models
 - **`run_lora.sh`** - Bash runner script (recommended)
 - **`setup_lora.sh`** - First-time setup script
@@ -20,52 +20,48 @@ This folder contains all files needed for LoRA (Low-Rank Adaptation) fine-tuning
 ### First Time Setup
 
 ```bash
-cd lora
-./setup_lora.sh  # Checks dependencies, creates directories, configures LoRA
+uv sync
+uv run bash lora/setup_lora.sh  # Creates directories and validates the LoRA workspace
 ```
 
-### Using Bash Scripts (Recommended)
+### Using uv Directly
 
 ```bash
-cd lora
-
 # Train with LoRA (uses lora_config.yaml by default)
-./run_lora.sh train
+uv run python lora/train_lora.py
 
 # Or with custom config
-./run_lora.sh train my_config.yaml
+CONFIG_FILE=my_config.yaml uv run python lora/train_lora.py
 
 # Compare base and LoRA models
-./run_lora.sh compare
+uv run python lora/lora_utils.py compare --base models/best_model.pt --lora models/final_lora_model.pt
 
 # Merge LoRA weights into base model
-./run_lora.sh merge
+uv run python lora/lora_utils.py merge --lora models/final_lora_model.pt --output models/merged.pt
 
 # Analyze LoRA statistics
-./run_lora.sh analyze
+uv run python lora/lora_utils.py analyze --lora models/final_lora_model.pt
 
 # Extract LoRA weights only
-./run_lora.sh extract
+uv run python lora/lora_utils.py extract --lora models/final_lora_model.pt --output models/lora_only.pt
 
 # Show help
-./run_lora.sh help
+uv run bash lora/run_lora.sh help
 ```
 
-### Using Python Directly
+### Using Bash Scripts
 
 ```bash
-cd lora
-
 # Train
-python local_geometry_gcn_stereo_lora.py
+uv run bash lora/run_lora.sh train
 
 # Or with custom config
-CONFIG_FILE=my_config.yaml python local_geometry_gcn_stereo_lora.py
+uv run bash lora/run_lora.sh train my_config.yaml
 
 # Utilities
-python lora_utils.py compare --base ../models/final_model.pt --lora ../models/final_lora_model.pt
-python lora_utils.py merge --lora ../models/final_lora_model.pt --output ../models/merged.pt
-python lora_utils.py analyze --lora ../models/final_lora_model.pt
+uv run bash lora/run_lora.sh compare
+uv run bash lora/run_lora.sh merge
+uv run bash lora/run_lora.sh analyze
 ```
 
 ## Documentation

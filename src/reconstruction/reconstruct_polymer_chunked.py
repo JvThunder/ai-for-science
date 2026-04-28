@@ -24,7 +24,7 @@ from mpl_toolkits.mplot3d import Axes3D
 # Import from reconstruction module
 import sys
 sys.path.insert(0, 'src')
-from reconstruction import (
+from reconstruction.reconstruction import (
     load_trained_model,
     reconstruct_from_center,
     align_molecules,

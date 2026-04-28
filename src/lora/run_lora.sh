@@ -76,7 +76,7 @@ cmd_train() {
     if ! check_file "$BASE_MODEL" "Base model"; then
         print_msg "$YELLOW" "Warning: Base model not found!"
         print_msg "$YELLOW" "Make sure to set 'lora.pretrained_checkpoint' in your config"
-        print_msg "$YELLOW" "Or train a base model first with: cd .. && python local_geometry_gcn_stereo.py"
+        print_msg "$YELLOW" "Or train a base model first with: uv run python src/train_model.py"
         echo ""
         read -p "Continue anyway? (y/N): " -n 1 -r
         echo ""
@@ -92,7 +92,7 @@ cmd_train() {
     # Set config path and run
     export CONFIG_FILE="$config"
     cd "$PROJECT_ROOT"
-    python "$SCRIPT_DIR/local_geometry_gcn_stereo_lora.py"
+    uv run python "$SCRIPT_DIR/train_lora.py"
 
     print_msg "$GREEN" "✓ Training complete!"
 }
@@ -108,7 +108,7 @@ cmd_compare() {
     check_file "$lora" "LoRA model" || exit 1
 
     print_msg "$GREEN" "Comparing models..."
-    python "$SCRIPT_DIR/lora_utils.py" compare --base "$base" --lora "$lora"
+    uv run python "$SCRIPT_DIR/lora_utils.py" compare --base "$base" --lora "$lora"
 }
 
 # Merge command
@@ -124,7 +124,7 @@ cmd_merge() {
     print_msg "$GREEN" "Output: $output"
     echo ""
 
-    python "$SCRIPT_DIR/lora_utils.py" merge --lora "$lora" --output "$output"
+    uv run python "$SCRIPT_DIR/lora_utils.py" merge --lora "$lora" --output "$output"
 
     print_msg "$GREEN" "✓ Merge complete!"
 }
@@ -137,7 +137,7 @@ cmd_analyze() {
 
     check_file "$lora" "LoRA model" || exit 1
 
-    python "$SCRIPT_DIR/lora_utils.py" analyze --lora "$lora"
+    uv run python "$SCRIPT_DIR/lora_utils.py" analyze --lora "$lora"
 }
 
 # Extract command
@@ -153,7 +153,7 @@ cmd_extract() {
     print_msg "$GREEN" "Output: $output"
     echo ""
 
-    python "$SCRIPT_DIR/lora_utils.py" extract --lora "$lora" --output "$output"
+    uv run python "$SCRIPT_DIR/lora_utils.py" extract --lora "$lora" --output "$output"
 
     print_msg "$GREEN" "✓ Extraction complete!"
 }

@@ -38,40 +38,19 @@ print_header() {
 check_python() {
     print_header "Checking Python Environment"
 
-    if ! command -v python &> /dev/null; then
-        print_msg "$RED" "✗ Python not found!"
+    if ! command -v uv &> /dev/null; then
+        print_msg "$RED" "✗ uv not found!"
         exit 1
     fi
 
-    local python_version=$(python --version 2>&1 | awk '{print $2}')
-    print_msg "$GREEN" "✓ Python $python_version found"
+    local uv_version=$(uv --version | awk '{print $2}')
+    print_msg "$GREEN" "✓ uv $uv_version found"
 
-    # Check required packages
-    print_msg "$YELLOW" "Checking required packages..."
+    print_msg "$YELLOW" "Syncing project dependencies..."
+    uv sync
 
-    local packages=("torch" "torch_geometric" "numpy" "pandas" "pyyaml")
-    local missing=()
-
-    for pkg in "${packages[@]}"; do
-        if python -c "import $pkg" 2>/dev/null; then
-            print_msg "$GREEN" "  ✓ $pkg"
-        else
-            print_msg "$RED" "  ✗ $pkg (missing)"
-            missing+=("$pkg")
-        fi
-    done
-
-    if [ ${#missing[@]} -gt 0 ]; then
-        print_msg "$YELLOW" ""
-        print_msg "$YELLOW" "Missing packages detected. Install with:"
-        print_msg "$YELLOW" "  pip install ${missing[*]}"
-        echo ""
-        read -p "Install now? (y/N): " -n 1 -r
-        echo ""
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            pip install "${missing[@]}"
-        fi
-    fi
+    print_msg "$YELLOW" "Optional wandb support is available with:"
+    print_msg "$YELLOW" "  uv sync --extra wandb"
 }
 
 # Create directories
@@ -109,7 +88,7 @@ check_base_model() {
         print_msg "$YELLOW" "You need a pre-trained base model for LoRA fine-tuning."
         print_msg "$YELLOW" "Options:"
         print_msg "$YELLOW" "  1. Train a new base model:"
-        print_msg "$YELLOW" "     cd $PROJECT_ROOT && python local_geometry_gcn_stereo.py"
+        print_msg "$YELLOW" "     cd $PROJECT_ROOT && uv run python src/train_model.py"
         print_msg "$YELLOW" "  2. Specify existing model path in lora_config.yaml:"
         print_msg "$YELLOW" "     lora.pretrained_checkpoint: '/path/to/your/model.pt'"
         echo ""
@@ -159,21 +138,21 @@ show_next_steps() {
     print_msg "$GREEN" "   nano $SCRIPT_DIR/lora_config.yaml"
     echo ""
     print_msg "$YELLOW" "2. Start fine-tuning:"
-    print_msg "$GREEN" "   cd $SCRIPT_DIR"
-    print_msg "$GREEN" "   ./run_lora.sh train"
+    print_msg "$GREEN" "   cd $PROJECT_ROOT"
+    print_msg "$GREEN" "   uv run bash lora/run_lora.sh train"
     echo ""
     print_msg "$YELLOW" "3. Or use the Python script directly:"
-    print_msg "$GREEN" "   python $SCRIPT_DIR/local_geometry_gcn_stereo_lora.py"
+    print_msg "$GREEN" "   uv run python $SCRIPT_DIR/train_lora.py"
     echo ""
     print_msg "$YELLOW" "4. Compare models after training:"
-    print_msg "$GREEN" "   ./run_lora.sh compare"
+    print_msg "$GREEN" "   uv run bash lora/run_lora.sh compare"
     echo ""
     print_msg "$YELLOW" "5. Merge LoRA weights for inference:"
-    print_msg "$GREEN" "   ./run_lora.sh merge"
+    print_msg "$GREEN" "   uv run bash lora/run_lora.sh merge"
     echo ""
     print_msg "$BLUE" "For more information:"
     print_msg "$GREEN" "   cat $SCRIPT_DIR/LORA_FINETUNING.md"
-    print_msg "$GREEN" "   ./run_lora.sh help"
+    print_msg "$GREEN" "   uv run bash lora/run_lora.sh help"
     echo ""
 }
 

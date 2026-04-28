@@ -65,7 +65,7 @@ class MetricsLogger:
         # Wandb setup
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         if use_wandb and not WANDB_AVAILABLE:
-            print("Warning: wandb requested but not installed. Install with: pip install wandb")
+            print("Warning: wandb requested but not installed. Install with: uv sync --extra wandb")
             print("Continuing without wandb logging...")
 
         # Metrics storage (using iterations instead of epochs)

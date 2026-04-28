@@ -22,7 +22,7 @@ LoRA Configuration:
 
 Usage:
     # Fine-tune with lora_config.yaml
-    python local_geometry_gcn_stereo_lora.py
+    uv run python lora/train_lora.py
 
     # Configure LoRA settings in config YAML:
     # lora:
@@ -694,7 +694,7 @@ def init_wandb(config):
 
     if not WANDB_AVAILABLE:
         print("Warning: wandb requested in config but not installed.")
-        print("Install with: pip install wandb")
+        print("Install with: uv sync --extra wandb")
         print("Continuing without wandb logging...")
         return False
 

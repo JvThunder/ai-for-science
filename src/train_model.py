@@ -15,7 +15,7 @@ Key Features:
 
 Usage:
     # Train with config.yaml (all settings configured in the file)
-    python local_geometry_gcn_stereo.py
+    uv run python src/train_model.py
 
     # To resume from a specific checkpoint, set 'resume_checkpoint' in config.yaml:
     # training:
@@ -460,7 +460,7 @@ def init_wandb(config):
 
     if not WANDB_AVAILABLE:
         print("Warning: wandb requested in config but not installed.")
-        print("Install with: pip install wandb")
+        print("Install with: uv sync --extra wandb")
         print("Continuing without wandb logging...")
         return False
 
