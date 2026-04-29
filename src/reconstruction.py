@@ -24,12 +24,13 @@ import warnings
 warnings.filterwarnings("ignore")
 import imageio
 import io
+from tqdm import tqdm
 
 # Import utilities from the project
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.model import LocalGeometryGCN
-from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, parse_pubchem_data, _pubchem_mapping_has_error, get_element_vocab, dfs_subgraph
+from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, get_element_vocab, dfs_subgraph
 from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
 from utils.config import load_config
 from utils.loss import total_loss, percentage_loss, geometry_loss
@@ -119,37 +120,21 @@ def load_molecule_from_csv(
     """
     df = pd.read_csv(csv_path)
 
-    # Find valid molecules (geometry_xyz always required for 3D coords)
+    # Find valid molecules (with bonding_status="OK")
     valid_rows = []
     for idx, row in df.iterrows():
-        if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
-            continue
-        use_pubchem = (
-            'Pubchem_to_xyz_aid_mapping' in row
-            and not _pubchem_mapping_has_error(row.get('Pubchem_to_xyz_aid_mapping'))
-        )
-        if use_pubchem:
-            valid_rows.append((idx, row, True))
-        elif row.get('bonding_status') == 'OK' and not pd.isna(row.get('bonds_geom_valence', float('nan'))):
-            valid_rows.append((idx, row, False))
+        if row.get('bonding_status') == 'OK':
+            if 'geometry_xyz' in row and not pd.isna(row['geometry_xyz']):
+                if 'bonds_geom_valence' in row and not pd.isna(row['bonds_geom_valence']):
+                    valid_rows.append((idx, row))
 
     if molecule_idx >= len(valid_rows):
         raise IndexError(f"Molecule index {molecule_idx} out of range (only {len(valid_rows)} valid molecules)")
 
-    idx, row, use_pubchem = valid_rows[molecule_idx]
+    idx, row = valid_rows[molecule_idx]
 
-    xyz_coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
-
-    if use_pubchem:
-        coordinates, elements, bonds_data = parse_pubchem_data(row, xyz_coordinates)
-        if not coordinates or not bonds_data:
-            # Fallback if PubChem parsing failed
-            coordinates, elements = xyz_coordinates, xyz_elements
-            bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
-    else:
-        coordinates, elements = xyz_coordinates, xyz_elements
-        bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
-
+    coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+    bonds_data = parse_bonds_from_dataset(row['bonds_geom_valence'])
     cid = row.get('cid', f'molecule_{idx}')
 
     return coordinates, elements, bonds_data, cid
@@ -2142,12 +2127,226 @@ def reconstruction_demo(
     return results
 
 
-if __name__ == "__main__":
+#if __name__ == "__main__":
     # Run demo with 3 example molecules
-    results = reconstruction_demo(
-        checkpoint_path="checkpoints/best_model.pt",
-        csv_path="data/Compound_000000001_000025000_props_geom_3.csv",
-        config_path="config.yaml",
-        molecule_indices=[0, 1, 2],  # First 3 valid molecules
-        output_dir="reconstruction_results"
+#    results = reconstruction_demo(
+#        checkpoint_path=r"C:\Users\NGenu\Documents\Matthew\Bonding Distance Prediction\ai-for-science-main\Best Performance (0.007632)\checkpoints\best_model.pt",
+#        csv_path=r"D:\B3YLP-PM6 Database\Compound_000000001_000025000_props_geom.csv",
+#        config_path=r"C:\Users\NGenu\Documents\Matthew\ai-for-science-main\config\config.yaml",
+#        molecule_indices=[4, 5, 6,7,8],  # First 3 valid molecules
+#        output_dir=r"C:\Users\NGenu\Documents\Matthew\ai-for-science-main\reconstruction_results"
+#    )
+
+def count_valid_molecules_in_csv(csv_path: str) -> int:
+    df = pd.read_csv(csv_path)
+
+    mask = (
+        (df.get("bonding_status") == "OK") &
+        df.get("geometry_xyz").notna() &
+        df.get("bonds_geom_valence").notna()
+    )
+
+    return int(mask.sum())
+
+def reconstruction_demo_rmsd_vs_atoms(
+    checkpoint_path: str = "checkpoints/best_model.pt",
+    csv_dir: str = "data",
+    config_path: str = "config.yaml",
+    output_dir: str = "reconstruction_results_rmsd_vs_atoms",
+    molecule_indices: List[int] = None,
+    num_workers: int = 1,
+    resume: bool = True,
+    flush_every: int = 100,
+):
+    print("=" * 70)
+    print("RMSD vs Atom Count (Batch over CSV folder)")
+    print("=" * 70)
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    per_csv_dir = output_path / "per_csv"
+    per_csv_dir.mkdir(parents=True, exist_ok=True)
+
+    def _safe_stem(p: Path) -> str:
+        return "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in p.stem)
+
+    def _per_csv_paths(csv_path: Path):
+        stem = _safe_stem(csv_path)
+        results_csv = per_csv_dir / f"{stem}__results.csv"
+        log_txt = per_csv_dir / f"{stem}__log.txt"
+        return results_csv, log_txt
+
+    print("\n[1] Loading trained model...")
+    model, element_to_idx, device = load_trained_model(checkpoint_path, config_path)
+    model.eval()
+
+    config = load_config(config_path)
+    max_bonds = config["model"]["max_bonds"]
+
+    csv_dir_path = Path(csv_dir)
+    csv_files = sorted(csv_dir_path.glob("*.csv"))
+    if not csv_files:
+        raise FileNotFoundError(f"No .csv files found in: {csv_dir_path}")
+
+    print(f"\n[2] Found {len(csv_files)} CSV files")
+
+    def _compute_one(csv_path: Path, mol_idx: int):
+        coords, elements, bonds, cid = load_molecule_from_csv(str(csv_path), mol_idx)
+        original_coords = np.array(coords)
+
+        reconstructed_coords = reconstruct_molecule(
+            model, elements, bonds, element_to_idx, device, max_bonds
+        )
+        aligned_coords = align_molecules(reconstructed_coords, original_coords)
+        rmsd_value = compute_rmsd(aligned_coords, original_coords)
+
+        loss_dict = compute_reconstruction_loss(
+            model, original_coords, aligned_coords, elements, bonds,
+            element_to_idx, device, max_bonds, config
+        )
+
+        return {
+            "csv": csv_path.name,
+            "cid": cid,
+            "mol_idx": mol_idx,
+            "n_atoms": int(len(elements)),
+            "rmsd": float(rmsd_value),
+            "loss_total": float(loss_dict["total"]),
+            "loss_distance": float(loss_dict["distance"]),
+            "loss_geometry": float(loss_dict["geometry"]),
+        }
+
+    if num_workers > 1:
+        raise NotImplementedError("GPU runs must use num_workers=1")
+
+    total_success = 0
+    failed = 0
+
+    print("\n[3] Computing RMSD for molecules...")
+
+    for csv_path in tqdm(csv_files, desc="CSV files"):
+
+        results_csv_path, log_txt_path = _per_csv_paths(csv_path)
+
+        if not log_txt_path.exists():
+            with open(log_txt_path, "w", encoding="utf-8") as f:
+                f.write(f"CSV: {csv_path.name}\n")
+                f.write("idx cid n_atoms rmsd loss_total loss_dist loss_geom\n")
+
+        if molecule_indices is None:
+            n_mols = count_valid_molecules_in_csv(str(csv_path))
+            all_indices = list(range(n_mols))
+        else:
+            all_indices = list(molecule_indices)
+
+        processed_idx = set()
+        if resume and results_csv_path.exists():
+            prev = pd.read_csv(results_csv_path, usecols=["mol_idx"])
+            processed_idx = set(prev["mol_idx"].astype(int).tolist())
+            tqdm.write(f"[RESUME] {csv_path.name}: {len(processed_idx)} done")
+
+        idx_iter = [i for i in all_indices if i not in processed_idx]
+        if not idx_iter:
+            continue
+
+        log_buffer = []
+        new_records = []
+
+        for mol_idx in tqdm(idx_iter, desc=csv_path.name, leave=False):
+            try:
+                rec = _compute_one(csv_path, mol_idx)
+                new_records.append(rec)
+                total_success += 1
+
+                log_buffer.append(
+                    f"{rec['mol_idx']} {rec['cid']} {rec['n_atoms']} "
+                    f"{rec['rmsd']:.6f} {rec['loss_total']:.6f} "
+                    f"{rec['loss_distance']:.6f} {rec['loss_geometry']:.6f}\n"
+                )
+
+                if flush_every and len(new_records) >= flush_every:
+                    df_new = pd.DataFrame.from_records(new_records)
+
+                    if results_csv_path.exists():
+                        df_new.to_csv(results_csv_path, mode="a", header=False, index=False)
+                    else:
+                        df_new.to_csv(results_csv_path, index=False)
+
+                    with open(log_txt_path, "a", encoding="utf-8") as f:
+                        f.writelines(log_buffer)
+
+                    new_records.clear()
+                    log_buffer.clear()
+
+            except Exception:
+                failed += 1
+                continue
+
+        # Final flush for this CSV
+        if new_records:
+            df_new = pd.DataFrame.from_records(new_records)
+            if results_csv_path.exists():
+                df_new.to_csv(results_csv_path, mode="a", header=False, index=False)
+            else:
+                df_new.to_csv(results_csv_path, index=False)
+
+        if log_buffer:
+            with open(log_txt_path, "a", encoding="utf-8") as f:
+                f.writelines(log_buffer)
+
+    print("\n" + "=" * 70)
+    print("Summary")
+    print("=" * 70)
+    print(f"Total successful reconstructions: {total_success}")
+    print(f"Total failures (skipped): {failed}")
+
+    # --- Aggregate from per-CSV result files ---
+    print("\n[4] Aggregating per-CSV results for plotting...")
+    all_result_files = sorted(per_csv_dir.glob("*__results.csv"))
+
+    dfs = []
+    for f in all_result_files:
+        dfs.append(pd.read_csv(f))
+
+    if not dfs:
+        raise RuntimeError("No results found to plot.")
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    grouped = (
+        df.groupby("n_atoms")["rmsd"]
+        .mean()
+        .reset_index()
+        .sort_values("n_atoms")
+    )
+
+    plt.figure()
+    plt.plot(grouped["n_atoms"], grouped["rmsd"], marker="o")
+    plt.xlabel("Number of atoms")
+    plt.ylabel("Mean RMSD (Å)")
+    plt.title("Mean RMSD vs Number of Atoms")
+    plt.grid(True)
+
+    fig_path = output_path / "mean_rmsd_vs_atoms.png"
+    plt.savefig(fig_path, dpi=200, bbox_inches="tight")
+    plt.show()
+
+    print(f"Saved plot to: {fig_path}")
+
+    return df, grouped
+
+
+if __name__ == "__main__":
+    # Example main: process all CSVs in a folder, try first 200 molecule indices per CSV.
+    # If you have a specific index list you want to reuse for every CSV, set molecule_indices=[...].
+    df, grouped = reconstruction_demo_rmsd_vs_atoms(
+        checkpoint_path=r"checkpoints\best_model.pt",
+        csv_dir=r"D:\B3YLP-PM6 Database",
+        config_path=r"config\config.yaml",
+        output_dir=r"reconstruction_results_rmsd_vs_atoms",
+        molecule_indices=None,        # auto-scan indices 0..max_mols_per_csv-1
+        num_workers=1,                # keep 1 if using GPU
+        resume= True,
+        flush_every=100,   # write to txt every N successful molecules
     )

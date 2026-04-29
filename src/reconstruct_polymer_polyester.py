@@ -17,12 +17,15 @@ sys.path.insert(0, 'src')
 from reconstruction import load_trained_model, reconstruct_from_center
 
 
-def create_polyethylene_chain(n_carbons: int) -> tuple:
+def create_polyester_chain(n_repeat_units: int) -> tuple:
     """
-    Create a simple polyethylene chain with n carbon atoms.
+    Create a simplified aliphatic polyester chain.
+
+    Repeat unit:
+        -O-CH2-CH2-C(=O)-
 
     Args:
-        n_carbons: Number of carbon atoms in the chain
+        n_repeat_units: Number of polyester repeat units
 
     Returns:
         elements: List of element symbols
@@ -32,36 +35,71 @@ def create_polyethylene_chain(n_carbons: int) -> tuple:
     bonds = []
 
     atom_idx = 0
-    for c_idx in range(n_carbons):
-        # Add carbon
-        c_atom_idx = atom_idx
-        elements.append('C')
+    previous_carbonyl_c = None
+
+    for unit in range(n_repeat_units):
+        # Ether oxygen
+        o_ether = atom_idx
+        elements.append("O")
         atom_idx += 1
 
-        # Add 2 hydrogens per carbon
-        h1_idx = atom_idx
-        elements.append('H')
+        # CH2 carbon 1
+        c1 = atom_idx
+        elements.append("C")
         atom_idx += 1
 
-        h2_idx = atom_idx
-        elements.append('H')
+        # CH2 carbon 2
+        c2 = atom_idx
+        elements.append("C")
         atom_idx += 1
 
-        # C-H bonds
-        bonds.append({'i': c_atom_idx, 'j': h1_idx, 'order': 1.0})
-        bonds.append({'i': c_atom_idx, 'j': h2_idx, 'order': 1.0})
+        # Carbonyl carbon
+        c_carbonyl = atom_idx
+        elements.append("C")
+        atom_idx += 1
 
-        # C-C backbone bond (except for last carbon)
-        if c_idx < n_carbons - 1:
-            next_c_idx = c_atom_idx + 3  # Next carbon is 3 atoms away
-            bonds.append({'i': c_atom_idx, 'j': next_c_idx, 'order': 1.0})
+        # Carbonyl oxygen
+        o_carbonyl = atom_idx
+        elements.append("O")
+        atom_idx += 1
 
-    print(f"Created polyethylene chain:")
-    print(f"  Carbons: {n_carbons}")
-    print(f"  Total atoms: {len(elements)} ({n_carbons}C + {len(elements) - n_carbons}H)")
+        # Connect previous repeat unit to current ester oxygen
+        if previous_carbonyl_c is not None:
+            bonds.append({'i': previous_carbonyl_c, 'j': o_ether, 'order': 1.0})
+
+        # Main polyester backbone: O-CH2-CH2-C(=O)
+        bonds.append({'i': o_ether, 'j': c1, 'order': 1.0})
+        bonds.append({'i': c1, 'j': c2, 'order': 1.0})
+        bonds.append({'i': c2, 'j': c_carbonyl, 'order': 1.0})
+        bonds.append({'i': c_carbonyl, 'j': o_carbonyl, 'order': 2.0})
+
+        # Hydrogens on CH2 groups
+        for carbon in [c1, c2]:
+            for _ in range(2):
+                h = atom_idx
+                elements.append("H")
+                atom_idx += 1
+                bonds.append({'i': carbon, 'j': h, 'order': 1.0})
+
+        previous_carbonyl_c = c_carbonyl
+
+    # Terminal hydrogens: H-O-...-C(=O)-H simplified
+    h_start = atom_idx
+    elements.append("H")
+    atom_idx += 1
+    bonds.append({'i': 0, 'j': h_start, 'order': 1.0})
+
+    h_end = atom_idx
+    elements.append("H")
+    atom_idx += 1
+    bonds.append({'i': previous_carbonyl_c, 'j': h_end, 'order': 1.0})
+
+    print("Created polyester chain:")
+    print(f"  Repeat units: {n_repeat_units}")
+    print(f"  Total atoms: {len(elements)}")
     print(f"  Total bonds: {len(bonds)}")
-    print(f"  C-C backbone bonds: {n_carbons - 1}")
-    print(f"  C-H bonds: {2 * n_carbons}")
+    print(f"  Backbone atoms: {5 * n_repeat_units}")
+    print("  Repeat unit: -O-CH2-CH2-C(=O)-")
 
     return elements, bonds
 
@@ -98,7 +136,7 @@ def analyze_structure(elements, positions, bonds):
         print(f"    Expected: ~1.09 Å")
 
 
-def export_to_xyz(elements, positions, filepath, comment="Polyethylene chain"):
+def export_to_xyz(elements, positions, filepath, comment="Polyester chain"):
     """Export structure to XYZ format."""
     with open(filepath, 'w') as f:
         f.write(f"{len(elements)}\n")
@@ -175,7 +213,7 @@ def visualize_structure(elements, positions, bonds, filepath):
 
 def main():
     parser = argparse.ArgumentParser(description='Simple polymer reconstruction')
-    parser.add_argument('--n_carbons', type=int, default=3,
+    parser.add_argument('--n_carbons', type=int, default=10,
                        help='Number of carbon atoms in chain')
     parser.add_argument('--output_dir', type=str, default='polymer_results',
                        help='Output directory')
@@ -193,18 +231,18 @@ def main():
     print("\n[1] Loading model...")
     model, element_vocab, device = load_trained_model(
         checkpoint_path='checkpoints/best_model.pt',
-        config_path='src/config.yaml'
+        config_path='config/config.yaml'
     )
 
     # Load config separately for max_bonds
     import yaml
-    with open('src/config.yaml', 'r') as f:
+    with open('config/config.yaml', 'r') as f:
         config = yaml.safe_load(f)
     config['device'] = device
 
     # Create polymer chain
-    print(f"\n[2] Creating {args.n_carbons}-carbon polyethylene chain...")
-    elements, bonds = create_polyethylene_chain(args.n_carbons)
+    print(f"\n[2] Creating {args.n_carbons}-carbon Polyester chain...")
+    elements, bonds = create_polyester_chain(args.n_carbons)
 
     # Reconstruct 3D structure
     print("\n[3] Reconstructing 3D structure...")
@@ -237,11 +275,11 @@ def main():
 
     # Export
     print("\n[4] Exporting files...")
-    xyz_file = output_dir / 'polyethylene_simple.xyz'
-    png_file = output_dir / 'polyethylene_simple.png'
+    xyz_file = output_dir / 'polyester_simple.xyz'
+    png_file = output_dir / 'polyester_simple.png'
 
     export_to_xyz(elements, positions, xyz_file,
-                 comment=f"Polyethylene chain - {args.n_carbons} carbons")
+                 comment=f"polyester chain - {args.n_carbons} carbons")
     visualize_structure(elements, positions, bonds, png_file)
 
     print("\n" + "="*60)
