@@ -54,6 +54,7 @@ ATOMIC_NUM_TO_SYMBOL: Dict[int, str] = {
     86: 'Rn',
 }
 
+GEOMETRY_COLUMN = "DFT_PBE_USPP_Optimized_Geometry"
 
 def _pubchem_mapping_has_error(mapping_val) -> bool:
     """Return True if Pubchem_to_xyz_aid_mapping contains the word 'error' (case-insensitive)."""
@@ -91,7 +92,7 @@ def parse_pubchem_data(row, xyz_coordinates: List[List[float]]) -> Tuple[List[Li
 
     Args:
         row: DataFrame row with PubChem columns
-        xyz_coordinates: 3D coordinates already parsed from geometry_xyz
+        xyz_coordinates: 3D coordinates already parsed from GEOMETRY_COLUMN
 
     Returns:
         coordinates: List of [x, y, z] in PubChem atom ordering (mapped from XYZ)
@@ -457,8 +458,8 @@ class MultiFileStreamingDataset(Dataset):
         for chunk in pd.read_csv(self.current_file, chunksize=self.chunk_size):
             for row_in_chunk, (_, row) in enumerate(chunk.iterrows()):
                 try:
-                    # Always need geometry_xyz for 3D coordinates
-                    if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
+                    # Always need GEOMETRY_COLUMN for 3D coordinates
+                    if GEOMETRY_COLUMN not in row or pd.isna(row[GEOMETRY_COLUMN]):
                         continue
 
                     # Require valid PubChem mapping
@@ -470,7 +471,7 @@ class MultiFileStreamingDataset(Dataset):
                         continue
 
                     # Parse 3D coordinates from XYZ
-                    coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
+                    coordinates, xyz_elements = parse_xyz_string(row[GEOMETRY_COLUMN])
                     if not coordinates or len(coordinates) < 2:
                         continue
 
@@ -720,7 +721,7 @@ class MultiFileStreamingDataset(Dataset):
             4. Scalability: Memory-efficient for large molecules (only local context extracted)
         """
         # Parse 3D coordinates from XYZ (always needed for geometry)
-        xyz_coordinates, xyz_elements = parse_xyz_string(row['geometry_xyz'])
+        xyz_coordinates, xyz_elements = parse_xyz_string(row[GEOMETRY_COLUMN])
 
         # Determine whether to use PubChem columns
         use_pubchem = (
@@ -1046,10 +1047,10 @@ def create_elements_txt_from_data(
         for chunk in pd.read_csv(file_path, chunksize=10000):
             for _, row in chunk.iterrows():
                 try:
-                    if 'geometry_xyz' not in row or pd.isna(row['geometry_xyz']):
+                    if GEOMETRY_COLUMN not in row or pd.isna(row[GEOMETRY_COLUMN]):
                         continue
 
-                    coordinates, elements = parse_xyz_string(row['geometry_xyz'])
+                    coordinates, elements = parse_xyz_string(row[GEOMETRY_COLUMN])
                     if not elements:
                         continue
 

@@ -12,6 +12,7 @@ import torch
 sys.path.insert(0, "src")
 from reconstruction import load_trained_model, reconstruct_from_center
 
+N_RUNS = 5
 
 def create_polyethylene_chain(n_carbons: int) -> tuple:
     """
@@ -381,7 +382,7 @@ SIZES = (
     list(range(1, 11))
     + list(range(20, 101, 10))
     + list(range(200, 1001, 100))
-    + list(range(2000, 10001, 1000))
+    + list(range(5000, 10001, 1000))
     + list(range(20000, 100001, 10000))
     + list(range(200000, 900001, 100000))
 )
@@ -481,10 +482,25 @@ def benchmark_one(polymer_name, builder, size, model, element_vocab, device, max
 
 
 def append_result(row):
+    fieldnames = [
+        "polymer",
+        "size_input",
+        "run_idx",
+        "n_runs",
+        "n_atoms",
+        "n_bonds",
+        "generation_time_s",
+        "reconstruction_time_s",
+        "total_time_s",
+        "xyz_file",
+        "status",
+        "error",
+    ]
+
     write_header = not OUT_CSV.exists()
 
     with open(OUT_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
 
         if write_header:
             writer.writeheader()
@@ -540,65 +556,87 @@ def main():
 
     print(f"\nOutput folder: {OUT_DIR.resolve()}")
     print(f"Benchmark log: {OUT_CSV.name}")
+    print(f"Number of benchmark repeats: {N_RUNS}")
 
     print("\n[2] Starting benchmark...\n")
 
-    for polymer_name, builder in POLYMERS.items():
-
-        print("\n" + "=" * 70)
-        print(f"POLYMER: {polymer_name}")
-        print("=" * 70)
-
+    try:
         for size in SIZES:
 
-            print(f"{polymer_name:12s} size={size:7d}", end=" | ", flush=True)
+            print("\n" + "=" * 70)
+            print(f"MONOMER / REPEAT UNIT QTY: {size}")
+            print("=" * 70)
 
-            try:
-                row = benchmark_one(
-                    polymer_name=polymer_name,
-                    builder=builder,
-                    size=size,
-                    model=model,
-                    element_vocab=element_vocab,
-                    device=device,
-                    max_bonds=max_bonds,
-                )
+            for polymer_name, builder in POLYMERS.items():
 
-                append_result(row)
+                print("\n" + "-" * 70)
+                print(f"{polymer_name} | size={size}")
+                print("-" * 70)
 
-                print(
-                    f"atoms={row['n_atoms']:9d} "
-                    f"bonds={row['n_bonds']:9d} "
-                    f"recon={row['reconstruction_time_s']:.4f}s "
-                    f"saved={row['xyz_file']}"
-                )
+                for run_idx in range(1, N_RUNS + 1):
 
-            except KeyboardInterrupt:
-                print("\nStopped by user.")
-                return
+                    print(
+                        f"{polymer_name:12s} "
+                        f"size={size:7d} "
+                        f"run={run_idx:3d}/{N_RUNS}",
+                        end=" | ",
+                        flush=True,
+                    )
 
-            except Exception as e:
-                row = {
-                    "polymer": polymer_name,
-                    "size_input": size,
-                    "n_atoms": None,
-                    "n_bonds": None,
-                    "generation_time_s": None,
-                    "reconstruction_time_s": None,
-                    "total_time_s": None,
-                    "xyz_file": "",
-                    "status": "failed",
-                    "error": repr(e),
-                }
+                    try:
+                        row = benchmark_one(
+                            polymer_name=polymer_name,
+                            builder=builder,
+                            size=size,
+                            model=model,
+                            element_vocab=element_vocab,
+                            device=device,
+                            max_bonds=max_bonds,
+                        )
 
-                append_result(row)
+                        row["run_idx"] = run_idx
+                        row["n_runs"] = N_RUNS
 
-                print(f"FAILED: {e}")
-                traceback.print_exc()
-                break
+                        append_result(row)
+
+                        print(
+                            f"atoms={row['n_atoms']:9d} "
+                            f"bonds={row['n_bonds']:9d} "
+                            f"recon={row['reconstruction_time_s']:.4f}s "
+                            f"saved={row['xyz_file']}"
+                        )
+
+                    except Exception as e:
+                        row = {
+                            "polymer": polymer_name,
+                            "size_input": size,
+                            "n_atoms": None,
+                            "n_bonds": None,
+                            "generation_time_s": None,
+                            "reconstruction_time_s": None,
+                            "total_time_s": None,
+                            "xyz_file": "",
+                            "status": "failed",
+                            "error": repr(e),
+                            "run_idx": run_idx,
+                            "n_runs": N_RUNS,
+                        }
+
+                        append_result(row)
+
+                        print(f"FAILED: {e}")
+                        traceback.print_exc()
+                        break
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+        print("Previous completed benchmark rows are already saved.")
+        print(f"Saved in: {OUT_CSV.resolve()}")
+        return
 
     print("\nBenchmark complete.")
     print(f"All results saved in: {OUT_DIR.resolve()}")
+
 
 
 if __name__ == "__main__":

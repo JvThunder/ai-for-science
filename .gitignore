@@ -81,6 +81,11 @@ logs/
 *.err
 wandb/
 
+# Local metric outputs
+local_training_style_*.csv
+local_*_details.csv
+local_*.txt
+
 # Temporary files
 *.tmp
 *.temp
@@ -97,6 +102,7 @@ config_custom.yaml
 lora/lora_config_custom.yaml
 
 reconstruction_results/
+reconstruction_time/
 polymer_results/
 logs/
 data/
