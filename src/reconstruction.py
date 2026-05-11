@@ -31,7 +31,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.model import LocalGeometryGCN
 from utils.dataset import parse_xyz_string, parse_bonds_from_dataset, get_element_vocab, dfs_subgraph
-from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
+from utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys, compute_chirality_sign
 from utils.config import load_config
 from utils.loss import total_loss, percentage_loss, geometry_loss
 
@@ -79,11 +79,29 @@ def load_trained_model(
         depth=config['model'].get('depth', 1),
         use_bond_types=config['model'].get('use_bond_types', True),
         num_bond_types=config['model'].get('num_bond_types', 4),
-        bond_embedding_dim=config['model'].get('bond_embedding_dim', 8)
+        bond_embedding_dim=config['model'].get('bond_embedding_dim', 8),
+        use_chirality=config['model'].get('use_chirality', True)
     ).to(device)
 
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # If the checkpoint carries its own model config, rebuild the model with it
+    # so architecture always matches regardless of what config.yaml currently says.
+    ckpt_model_cfg = checkpoint.get('config', {}).get('model', {})
+    if ckpt_model_cfg:
+        model = LocalGeometryGCN(
+            num_node_features=vocab_size,
+            hidden_dim=ckpt_model_cfg.get('hidden_dim', config['model']['hidden_dim']),
+            max_bonds=config['data']['max_bonds'],
+            vocab_size=vocab_size,
+            embedding_dim=ckpt_model_cfg.get('embedding_dim', config['model']['embedding_dim']),
+            depth=ckpt_model_cfg.get('depth', config['model'].get('depth', 1)),
+            use_bond_types=ckpt_model_cfg.get('use_bond_types', True),
+            num_bond_types=ckpt_model_cfg.get('num_bond_types', 4),
+            bond_embedding_dim=ckpt_model_cfg.get('bond_embedding_dim', 8),
+            use_chirality=ckpt_model_cfg.get('use_chirality', config['model'].get('use_chirality', True))
+        ).to(device)
 
     # Handle different checkpoint formats
     if 'model_state_dict' in checkpoint:
@@ -237,12 +255,31 @@ def create_graph_data(
     edge_index = torch.tensor(edge_index, dtype=torch.long).t() if edge_index else torch.empty((2, 0), dtype=torch.long)
     edge_attr = torch.tensor(edge_attr, dtype=torch.long) if edge_attr else torch.empty((0,), dtype=torch.long)
 
+    # Compute chirality sign for every subgraph node using full-molecule context
+    bond_type_to_order = {0: 1.0, 1: 1.5, 2: 2.0, 3: 3.0}
+    element_list = list(elements)
+    chirality_values = []
+    for node_global in node_list:
+        global_neighbors = list(adjacency[node_global])
+        if len(global_neighbors) < 3:
+            chirality_values.append(0.0)
+            continue
+        global_bond_orders = {
+            (node_global, n): bond_type_to_order.get(bond_types_dict.get((node_global, n), 0), 1.0)
+            for n in global_neighbors
+        }
+        sort_keys = get_neighbor_sort_keys(global_neighbors, element_list, global_bond_orders, node_global)
+        sorted_nbrs = [n for n, _ in sorted(zip(global_neighbors, sort_keys), key=lambda kv: kv[1])]
+        chirality_values.append(compute_chirality_sign(pos, node_global, sorted_nbrs))
+    chirality = torch.tensor(chirality_values, dtype=torch.float)
+
     # Create Data object
     data = Data(
         x=subgraph_x.to(device),
         edge_index=edge_index.to(device),
         edge_attr=edge_attr.to(device),
         pos=subgraph_pos.to(device),
+        chirality=chirality.to(device),
         node_a=torch.tensor(new_node_a, dtype=torch.long).to(device),
         node_b=torch.tensor(new_node_b, dtype=torch.long).to(device)
     )
@@ -277,6 +314,232 @@ def predict_bond_geometry(
     geometry_b = geometry_b.squeeze().cpu().numpy()  # (max_bonds, 2)
 
     return distance, geometry_a, geometry_b
+
+
+def predict_geometry_averaged(
+    model: LocalGeometryGCN,
+    data: 'torch_geometric.data.Data',
+    device: torch.device,
+    n: int = 5
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Average n stochastic forward passes (dropout re-enabled) to reduce angle
+    prediction noise.  Returns mean distance and mean (theta, delta_phi) arrays.
+    """
+    dists, geom_as, geom_bs = [], [], []
+    model.train()  # re-enable dropout for stochastic sampling
+    with torch.no_grad():
+        for _ in range(n):
+            d, ga, gb = model(data)
+            dists.append(d.squeeze().cpu().item())
+            geom_as.append(ga.squeeze().cpu().numpy())
+            geom_bs.append(gb.squeeze().cpu().numpy())
+    model.eval()
+    return float(np.mean(dists)), np.mean(geom_as, axis=0), np.mean(geom_bs, axis=0)
+
+
+def find_ring_path(
+    adjacency: Dict[int, List[int]],
+    start: int,
+    end: int
+) -> List[int]:
+    """
+    BFS shortest path from start to end, skipping the direct start→end edge.
+    Returns ordered atom list [start, ..., end] forming the ring, or [] if none.
+    """
+    seen = {start}
+    queue = deque([[start]])
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        for nbr in adjacency.get(node, []):
+            if node == start and nbr == end:
+                continue  # skip the closing bond itself
+            if nbr == end:
+                return path + [end]
+            if nbr not in seen:
+                seen.add(nbr)
+                queue.append(path + [nbr])
+    return []
+
+
+# def _ideal_bond_angle(center: int, adjacency, elements, bond_orders) -> float:
+#     """Return ideal A-center-B bond angle in radians based on hybridization."""
+#     if elements is None or bond_orders is None:
+#         return math.radians(109.47)
+#     nbrs = adjacency.get(center, [])
+#     for nbr in nbrs:
+#         bo = bond_orders.get((center, nbr), bond_orders.get((nbr, center), 1.0))
+#         if abs(bo - 1.5) < 0.1 or bo >= 2.0:
+#             return math.radians(120.0)
+#     return math.radians(109.47)
+
+
+def enforce_ring_closure(
+    positions: np.ndarray,
+    ring_bonds: List[Tuple[int, int]],
+    predicted_distances: Dict[Tuple[int, int], float],
+    adjacency: Dict[int, List[int]],
+    elements: List[str] = None,
+    bond_orders: Dict[Tuple[int, int], float] = None,
+    n_iterations: int = 500,
+    predicted_angles: Dict[Tuple[int, int, int], float] = None,
+) -> np.ndarray:
+    """
+    Post-BFS optimization that enforces ring closure for ALL ring members.
+
+    Finds the complete ring path for each closing bond via BFS, frees every
+    ring atom, initializes them on an idealized 3D ring geometry (chair for
+    n=6), then minimizes both 1-2 bond-distance errors and 1-3 distance
+    errors (which encode C-C-C bond angles) to satisfy all ring constraints.
+    """
+    from scipy.optimize import minimize
+
+    if not ring_bonds:
+        return positions
+
+    # --- 1. Collect complete ring paths ----------------------------------------
+    all_ring_atoms: set = set()
+    ring_paths: List[List[int]] = []
+
+    for i, j in ring_bonds:
+        path = find_ring_path(adjacency, i, j)
+        if path:
+            ring_paths.append(path)
+            for a in path:
+                all_ring_atoms.add(a)
+        else:
+            all_ring_atoms.add(i)
+            all_ring_atoms.add(j)
+
+    free_atoms = sorted(all_ring_atoms)
+
+    # --- 2. Idealized ring initialization (chair for n=6, polygon otherwise) ---
+    init_pos = positions.copy()
+
+    for path in ring_paths:
+        n = len(path)
+        if n < 3:
+            continue
+
+        ring_bond_lengths = []
+        for k in range(n):
+            a, b = path[k], path[(k + 1) % n]
+            d = predicted_distances.get((a, b), predicted_distances.get((b, a)))
+            if d is None:
+                d = float(np.linalg.norm(positions[b] - positions[a]))
+            ring_bond_lengths.append(d)
+        avg_bond = float(np.mean(ring_bond_lengths))
+
+        ring_center = np.mean(positions[path], axis=0)
+
+        if n == 6:
+            # Determine avg ring-bond angle from model predictions or fall back to sp3.
+            # Derivation: for a chair hexagon, atoms alternate ±z0 around a ring of
+            # radius R.  The 1-2 bond length satisfies d² = R² + 4z0² and the
+            # bond angle satisfies cos(θ) = (−R²/2 − z0²) / d².  Solving:
+            #   z0 = d · sqrt(0.5 + cos(θ))
+            #   R  = d · sqrt(−1 − 4·cos(θ))
+            # (valid when −0.5 < cos(θ) < −0.25, i.e. 104.5° < θ < 120°)
+            thetas = []
+            if predicted_angles is not None:
+                for k in range(n):
+                    prev = path[(k - 1) % n]
+                    c    = path[k]
+                    nxt  = path[(k + 1) % n]
+                    t = (predicted_angles.get((prev, c, nxt)) or
+                         predicted_angles.get((nxt, c, prev)))
+                    if t is not None:
+                        thetas.append(t)
+            if thetas:
+                avg_theta = float(np.mean(thetas))
+                cos_t = math.cos(avg_theta)
+                z0 = avg_bond * math.sqrt(max(0.0, 0.5 + cos_t))
+                R  = avg_bond * math.sqrt(max(0.0, -1.0 - 4.0 * cos_t))
+            else:
+                R  = avg_bond / (2.0 * math.sin(math.pi / n))
+                z0 = 0.0
+            for k, atom in enumerate(path):
+                angle = k * math.pi / 3.0
+                z = z0 if k % 2 == 0 else -z0
+                init_pos[atom] = ring_center + np.array([R * math.cos(angle),
+                                                          R * math.sin(angle), z])
+        else:
+            R = avg_bond / (2.0 * math.sin(math.pi / n))
+            for k, atom in enumerate(path):
+                angle = 2.0 * math.pi * k / n
+                init_pos[atom] = ring_center + np.array([R * math.cos(angle),
+                                                          R * math.sin(angle), 0.0])
+
+    # --- 3. Build 1-2 and 1-3 constraint tables --------------------------------
+    ring_bond_keys = {(min(i, j), max(i, j)) for i, j in ring_bonds}
+
+    # Average predicted distances per ring (symmetric, reduces model noise)
+    ring_bond_targets: Dict[tuple, float] = {}
+    for path in ring_paths:
+        n = len(path)
+        dists = [predicted_distances.get((path[k], path[(k+1)%n]),
+                  predicted_distances.get((path[(k+1)%n], path[k])))
+                 for k in range(n)]
+        avg = float(np.mean([d for d in dists if d is not None])) if any(d is not None for d in dists) else 0.0
+        for k in range(n):
+            a, b = path[k], path[(k + 1) % n]
+            ring_bond_targets[(min(a, b), max(a, b))] = avg
+
+    # 1-3 distances encode the A-B-C bond angles: d_ac = law-of-cosines(d_ab, d_bc, θ_ideal)
+    one_three_targets: Dict[tuple, float] = {}
+    for path in ring_paths:
+        n = len(path)
+        for k in range(n):
+            prev_atom = path[(k - 1) % n]
+            center_atom = path[k]
+            next_atom = path[(k + 1) % n]
+            d_ab = ring_bond_targets.get((min(prev_atom, center_atom), max(prev_atom, center_atom)))
+            d_bc = ring_bond_targets.get((min(center_atom, next_atom), max(center_atom, next_atom)))
+            if d_ab is None or d_bc is None:
+                continue
+            theta = None
+            if predicted_angles is not None:
+                theta = (predicted_angles.get((prev_atom, center_atom, next_atom)) or
+                         predicted_angles.get((next_atom, center_atom, prev_atom)))
+            if theta is None:
+                continue
+            d_13 = math.sqrt(d_ab**2 + d_bc**2 - 2.0 * d_ab * d_bc * math.cos(theta))
+            key = (min(prev_atom, next_atom), max(prev_atom, next_atom))
+            one_three_targets[key] = d_13
+
+    # --- 4. Optimization: 1-2 distances (w=5) + 1-3 distances (w=3) ----------
+    x0 = init_pos[free_atoms].flatten()
+
+    def objective(x: np.ndarray) -> float:
+        pos = positions.copy()
+        free_pos = x.reshape(-1, 3)
+        for k, a in enumerate(free_atoms):
+            pos[a] = free_pos[k]
+        loss = 0.0
+
+        for (i, j), target in ring_bond_targets.items():
+            curr = np.linalg.norm(pos[j] - pos[i])
+            err = (curr - target) / (target + 1e-6)
+            loss += 5.0 * err * err
+
+        for (i, j), target in one_three_targets.items():
+            curr = np.linalg.norm(pos[j] - pos[i])
+            err = (curr - target) / (target + 1e-6)
+            loss += 3.0 * err * err
+
+        return loss
+
+    result = minimize(
+        objective, x0, method='L-BFGS-B',
+        options={'maxiter': n_iterations, 'ftol': 1e-12, 'gtol': 1e-8}
+    )
+
+    optimized = positions.copy()
+    opt_pos = result.x.reshape(-1, 3)
+    for k, a in enumerate(free_atoms):
+        optimized[a] = opt_pos[k]
+    return optimized
 
 
 def find_center_atom(adjacency: Dict[int, List[int]], n_atoms: int) -> int:
@@ -679,7 +942,8 @@ def reconstruct_from_center(
     element_to_idx: Dict[str, int],
     device: torch.device,
     max_bonds: int,
-    start_atom: int
+    start_atom: int,
+    n_avg: int = 5
 ) -> Tuple[np.ndarray, np.ndarray, Dict[int, List[int]], List[Tuple[int, int]], Dict[Tuple[int, int], float]]:
     """
     Reconstruct molecule starting from a specific atom without using original coordinates.
@@ -716,6 +980,7 @@ def reconstruct_from_center(
     reconstructed = np.zeros((n_atoms, 3))
     placed = np.zeros(n_atoms, dtype=bool)
     predicted_distances = {}
+    predicted_angles: Dict[Tuple[int, int, int], float] = {}
 
     # Find a neighbor to establish coordinate frame
     if not adjacency[start_atom]:
@@ -762,12 +1027,12 @@ def reconstruct_from_center(
 
         ref_atom_local = placed_neighbors[0]
 
-        # Get geometry predictions using reconstructed positions
+        # Get geometry predictions using averaged stochastic forward passes
         data, node_mapping, node_list = create_graph_data(
             reconstructed.tolist(), elements, bonds_data, element_to_idx,
             center, ref_atom_local, max_bonds, device=device
         )
-        _, geometry_center, _ = predict_bond_geometry(model, data, device)
+        _, geometry_center, _ = predict_geometry_averaged(model, data, device, n=n_avg)
 
         # Create local coordinate frame
         center_pos = torch.tensor(reconstructed[center], dtype=torch.float)
@@ -788,30 +1053,37 @@ def reconstruct_from_center(
         sort_keys = get_neighbor_sort_keys(all_neighbors, elements, bond_orders, center)
         sorted_neighbors_with_keys = sorted(zip(all_neighbors, sort_keys), key=lambda x: x[1])
         sorted_neighbors = [n for n, _ in sorted_neighbors_with_keys]
-        sorted_neighbors_excl_ref = [n for n in sorted_neighbors if n != ref_atom_local]
 
-        # Place unplaced neighbors
+        # Iterate over the FULL sorted list so each neighbor's slot index into
+        # geometry_center is correct even when ref_atom_local sits mid-list.
+        # cumulative_phi accumulates across ALL slots (including ref_atom_local's)
+        # to stay consistent with the training-data delta_phi encoding.
         cumulative_phi = 0.0
 
-        for slot_idx, neighbor in enumerate(sorted_neighbors_excl_ref):
-            if slot_idx >= max_bonds:
+        for full_slot_idx, neighbor in enumerate(sorted_neighbors):
+            if full_slot_idx >= max_bonds:
                 break
 
-            if placed[neighbor]:
-                if slot_idx > 0:
-                    delta_phi_deg = geometry_center[slot_idx, 1]
-                    cumulative_phi += delta_phi_deg
+            # Always update cumulative phi from slot 1 onward (even for skipped atoms)
+            if full_slot_idx > 0:
+                cumulative_phi += float(geometry_center[full_slot_idx, 1])
+
+            # Store model-predicted angle at center between ref_atom_local and this neighbor.
+            # Used by enforce_ring_closure so ring-angle constraints are model-driven.
+            if neighbor != ref_atom_local:
+                theta_pred = math.radians(float(geometry_center[full_slot_idx, 0]))
+                predicted_angles[(ref_atom_local, center, neighbor)] = theta_pred
+                predicted_angles[(neighbor, center, ref_atom_local)] = theta_pred
+
+            # Skip the reference atom (already placed, defines the bond axis)
+            if neighbor == ref_atom_local:
                 continue
 
-            theta_deg = geometry_center[slot_idx, 0]
+            if placed[neighbor]:
+                continue
 
-            if slot_idx == 0:
-                phi = 0.0
-            else:
-                delta_phi_deg = geometry_center[slot_idx, 1]
-                cumulative_phi += delta_phi_deg
-                phi = math.radians(cumulative_phi % 360.0)
-
+            theta_deg = float(geometry_center[full_slot_idx, 0])
+            phi = 0.0 if full_slot_idx == 0 else math.radians(cumulative_phi % 360.0)
             theta = math.radians(theta_deg)
 
             # Get predicted distance
@@ -826,14 +1098,63 @@ def reconstruct_from_center(
                 predicted_distances[(neighbor, center)] = pred_r
                 visited_bonds.add(bond_key)
             else:
-                # Use previously predicted distance
-                pred_r = predicted_distances[(center, neighbor)]
+                pred_r = predicted_distances.get((center, neighbor),
+                             predicted_distances.get((neighbor, center), 0.0))
 
             # Convert to Cartesian
             new_pos = spherical_to_cartesian(pred_r, theta, phi, coord_frame, center_pos)
             reconstructed[neighbor] = new_pos.numpy()
             placed[neighbor] = True
             queue.append(neighbor)
+
+    # ── Ring closure enforcement ───────────────────────────────────────────────
+    # Find bonds that exist in the molecule but were never traversed by BFS
+    # (these are the ring-closing edges).  Predict their distances then run a
+    # local optimization to pull ring atoms into agreement with all ring bonds.
+    ring_closing_bonds = []
+    for i, j in bond_list:
+        bond_key = (min(i, j), max(i, j))
+        if bond_key not in visited_bonds and placed[i] and placed[j]:
+            data_ring, _, _ = create_graph_data(
+                reconstructed.tolist(), elements, bonds_data, element_to_idx,
+                i, j, max_bonds, device=device
+            )
+            pred_r, _, _ = predict_bond_geometry(model, data_ring, device)
+            predicted_distances[(i, j)] = pred_r
+            predicted_distances[(j, i)] = pred_r
+            ring_closing_bonds.append((i, j))
+
+    if ring_closing_bonds:
+        pre_closure = reconstructed.copy()
+        reconstructed = enforce_ring_closure(
+            reconstructed, ring_closing_bonds, predicted_distances, adjacency,
+            elements=elements, bond_orders=bond_orders,
+            predicted_angles=predicted_angles
+        )
+
+        # Ring carbons moved to idealized positions; re-place their non-ring
+        # neighbors (e.g. H atoms) by projecting from the new carbon position
+        # along the original BFS-predicted direction at the predicted distance.
+        all_ring_atoms: set = set()
+        for i, j in ring_closing_bonds:
+            path = find_ring_path(adjacency, i, j)
+            if path:
+                all_ring_atoms.update(path)
+            else:
+                all_ring_atoms.update([i, j])
+
+        for ring_atom in all_ring_atoms:
+            for nbr in adjacency[ring_atom]:
+                if nbr in all_ring_atoms:
+                    continue
+                old_dir = pre_closure[nbr] - pre_closure[ring_atom]
+                old_len = np.linalg.norm(old_dir)
+                if old_len < 1e-6:
+                    continue
+                pred_d = predicted_distances.get(
+                    (ring_atom, nbr), predicted_distances.get((nbr, ring_atom), old_len)
+                )
+                reconstructed[nbr] = reconstructed[ring_atom] + (old_dir / old_len) * pred_d
 
     return reconstructed, placed, adjacency, bond_list, predicted_distances
 

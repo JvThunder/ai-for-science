@@ -234,7 +234,8 @@ def create_model(config, device):
         depth=config['model'].get('depth', 1),
         use_bond_types=config['model'].get('use_bond_types', True),
         num_bond_types=config['model'].get('num_bond_types', 4),
-        bond_embedding_dim=config['model'].get('bond_embedding_dim', 8)
+        bond_embedding_dim=config['model'].get('bond_embedding_dim', 8),
+        use_chirality=config['model'].get('use_chirality', True)
     ).to(device)
 
     # Initialize weights

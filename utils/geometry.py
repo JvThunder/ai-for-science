@@ -396,6 +396,37 @@ def rmsd(positions_pred: torch.Tensor, positions_true: torch.Tensor) -> float:
     return torch.sqrt(torch.mean(squared_dist)).item()
 
 
+def compute_chirality_sign(
+    pos: torch.Tensor,
+    center_idx: int,
+    sorted_neighbor_indices: List[int],
+    epsilon: float = 1e-4
+) -> float:
+    """
+    Compute the signed tetrahedral volume for a potential chiral center.
+
+    Uses the scalar triple product of bond vectors to the first three neighbors
+    in canonical CIP-priority order.  The sign is consistent across enantiomers
+    as long as the neighbour sort order (get_neighbor_sort_keys) is identical at
+    training and inference time.
+
+    Returns +1.0 or -1.0 for chiral centres, 0.0 for planar / < 3 neighbours.
+    """
+    if len(sorted_neighbor_indices) < 3:
+        return 0.0
+
+    center = pos[center_idx]
+    v1 = pos[sorted_neighbor_indices[0]] - center
+    v2 = pos[sorted_neighbor_indices[1]] - center
+    v3 = pos[sorted_neighbor_indices[2]] - center
+
+    vol = torch.dot(torch.cross(v1, v2, dim=0), v3).item()
+
+    if abs(vol) < epsilon:
+        return 0.0
+    return 1.0 if vol > 0 else -1.0
+
+
 def get_neighbor_sort_keys(
     neighbor_indices: List[int],
     elements: List[str],

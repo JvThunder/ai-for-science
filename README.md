@@ -5,8 +5,8 @@ GAT-based model that predicts local molecular geometry in spherical coordinates 
 ## Setup
 
 ```bash
-conda create -n gat python=3.10
-conda activate gat
+conda create -n gcn python=3.10
+conda activate gcn
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install -e .
 ```

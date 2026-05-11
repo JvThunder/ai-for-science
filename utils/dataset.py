@@ -37,7 +37,7 @@ import psutil
 
 # Import our geometry utilities
 sys.path.append(os.path.dirname(__file__))
-from geometry import compute_local_geometry, convert_to_relative_azimuthal, get_neighbor_sort_keys
+from geometry import compute_local_geometry, convert_to_relative_azimuthal, get_neighbor_sort_keys, compute_chirality_sign
 
 # Periodic table: atomic number → element symbol (covers common chemistry elements)
 ATOMIC_NUM_TO_SYMBOL: Dict[int, str] = {
@@ -858,6 +858,24 @@ class MultiFileStreamingDataset(Dataset):
                 new_i, new_j = node_mapping[old_i], node_mapping[old_j]
                 subgraph_bond_orders[(new_i, new_j)] = bond_type_to_order.get(btype, 1.0)
 
+        # Compute chirality sign for every subgraph node using full-molecule context.
+        # Using all direct neighbours (not just those in the subgraph) keeps the
+        # signed volume consistent regardless of subgraph depth.
+        chirality_values = []
+        for node_global in node_list:
+            global_neighbors = adjacency[node_global]
+            if len(global_neighbors) < 3:
+                chirality_values.append(0.0)
+                continue
+            global_bond_orders = {
+                (node_global, n): bond_type_to_order.get(bond_types_dict.get((node_global, n), 0), 1.0)
+                for n in global_neighbors
+            }
+            sort_keys = get_neighbor_sort_keys(global_neighbors, elements, global_bond_orders, node_global)
+            sorted_nbrs = [n for n, _ in sorted(zip(global_neighbors, sort_keys), key=lambda kv: kv[1])]
+            chirality_values.append(compute_chirality_sign(pos, node_global, sorted_nbrs))
+        chirality = torch.tensor(chirality_values, dtype=torch.float)
+
         # **NEW: Compute stereochemistry-aware local geometry**
         # For node A, use A→B bond as reference
         node_a_neighbors = [node_mapping[n] for n in adjacency[node_a] if n in node_mapping]
@@ -964,6 +982,7 @@ class MultiFileStreamingDataset(Dataset):
             edge_index=edge_index,
             edge_attr=edge_attr,  # Bond type: 0=single, 1=aromatic, 2=double, 3=triple
             pos=subgraph_pos,
+            chirality=chirality,  # (N_subgraph,) float: +1 R, -1 S, 0 achiral/planar
             node_a=new_node_a,
             node_b=new_node_b,
             target_distance=torch.tensor([target_distance], dtype=torch.float),

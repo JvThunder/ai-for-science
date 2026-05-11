@@ -91,15 +91,13 @@ Issues = "https://github.com/yourusername/stereochem-gcn/issues"
 # Command-line entry points
 stereochem-train = "local_geometry_gcn_stereo:main"
 stereochem-reconstruct = "reconstruction:main"
-lora-train = "lora.local_geometry_gcn_stereo_lora:main"
-lora-utils = "lora.lora_utils:main"
 
 # ============================================================================
 # Tool Configurations
 # ============================================================================
 
 [tool.setuptools]
-packages = ["utils", "lora"]
+packages = ["utils"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.txt", "*.md"]

@@ -66,7 +66,8 @@ def train_epoch(
     config: Dict,
     epoch: int,
     file_idx: int,
-    total_files: int
+    total_files: int,
+    pbar=None
 ) -> Dict[str, float]:
     """
     Train for one epoch (one file).
@@ -80,40 +81,47 @@ def train_epoch(
         epoch: Current epoch number
         file_idx: Current file index
         total_files: Total number of files
+        pbar: Optional outer tqdm bar shared across all files in the epoch.
+              When provided its total is expanded by this file's batch count
+              and it is updated per-batch instead of creating a per-file bar.
 
     Returns:
         metrics: Dictionary with average losses for this epoch
     """
     model.train()
 
-    total_loss = 0.0
+    total_loss_acc = 0.0
     total_distance_loss = 0.0
     total_geometry_loss = 0.0
     num_batches = 0
 
-    # Check for max batches limit (for testing)
     max_batches = config['training'].get('max_batches_per_epoch', None)
+    file_batches = max_batches if max_batches else len(train_loader)
 
-    pbar = tqdm(
-        train_loader,
-        desc=f"E{epoch+1} F{file_idx+1}/{total_files} train",
-        leave=False,
-        dynamic_ncols=True,
-        total=max_batches if max_batches else len(train_loader)
-    )
+    own_pbar = pbar is None
+    if own_pbar:
+        pbar = tqdm(
+            train_loader,
+            desc=f"E{epoch+1} F{file_idx+1}/{total_files} train",
+            leave=False,
+            dynamic_ncols=True,
+            total=file_batches
+        )
+        data_iter = pbar
+    else:
+        pbar.total = (pbar.total or 0) + file_batches
+        pbar.set_description(f"Epoch {epoch+1} [{file_idx+1}/{total_files}]")
+        pbar.refresh()
+        data_iter = train_loader
 
-    for batch_idx, data in enumerate(pbar):
+    for batch_idx, data in enumerate(data_iter):
         if max_batches and batch_idx >= max_batches:
             break
         optimizer.zero_grad()
 
-        # Compute loss
         loss_dict = compute_batch_loss(model, data, device, config)
-
-        # Backward pass
         loss_dict['total'].backward()
 
-        # Gradient clipping
         if config['training'].get('grad_clip', None):
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
@@ -122,29 +130,30 @@ def train_epoch(
 
         optimizer.step()
 
-        # Accumulate losses
-        total_loss += loss_dict['total'].item()
+        total_loss_acc += loss_dict['total'].item()
         total_distance_loss += loss_dict['distance'].item()
         total_geometry_loss += loss_dict['geometry'].item()
         num_batches += 1
 
-        # Update progress bar
+        if not own_pbar:
+            pbar.update(1)
+
         if num_batches > 0:
             pbar.set_postfix({
-                'Loss': f"{total_loss/num_batches:.4f}",
+                'Loss': f"{total_loss_acc/num_batches:.4f}",
                 'Dist': f"{total_distance_loss/num_batches:.4f}",
                 'Geom': f"{total_geometry_loss/num_batches:.4f}"
             })
 
-    # Compute averages
-    metrics = {
-        'total_loss': total_loss / num_batches if num_batches > 0 else 0.0,
+    if own_pbar:
+        pbar.close()
+
+    return {
+        'total_loss': total_loss_acc / num_batches if num_batches > 0 else 0.0,
         'distance_loss': total_distance_loss / num_batches if num_batches > 0 else 0.0,
         'geometry_loss': total_geometry_loss / num_batches if num_batches > 0 else 0.0,
         'num_batches': num_batches
     }
-
-    return metrics
 
 
 def validate_on_file(
@@ -497,27 +506,32 @@ def train_multi_file(
         print(f"Epoch {epoch + 1}/{num_epochs} (Sweeping all {total_files} files)")
         print(f"{'='*60}")
 
-        # Determine starting iteration for this epoch
         iteration_start = start_file_idx if epoch == start_epoch else 0
 
-        # Iterate through all files (1 file = 1 iteration)
-        for iteration in range(iteration_start, total_files):
-            print(f"\n[Epoch {epoch + 1}, Iteration {iteration + 1}/{total_files}]")
+        # Single progress bar shared across all training files this epoch
+        epoch_pbar = tqdm(
+            total=0,
+            desc=f"Epoch {epoch+1}/{num_epochs} [1/{total_files}]",
+            leave=True,
+            dynamic_ncols=True,
+            unit="batch"
+        )
 
+        epoch_train_total = 0.0
+        epoch_train_dist = 0.0
+        epoch_train_geom = 0.0
+        epoch_total_batches = 0
+        current_lr = optimizer.param_groups[0]['lr']
+
+        for iteration in range(iteration_start, total_files):
             # Switch to next file
-            # Skip file switching on very first iteration (file already loaded at index 0)
-            # OR if we're resuming from start_iteration (files already positioned correctly)
             should_switch = iteration > 0 and not (epoch == start_epoch and iteration == iteration_start and start_iteration > 0)
 
             if should_switch:
-                print(f"Switching to file {iteration + 1}/{total_files}...")
                 train_dataset.next_file()
-                # Validation dataset cycles through same files (uses k-fold split)
                 val_dataset.next_file()
             elif start_iteration > 0 and epoch == start_epoch and iteration == iteration_start:
-                # When resuming, we need to manually set the dataset to the correct file
                 print(f"Resuming at file {iteration + 1}/{total_files}...")
-                # Clear cache and set to correct file index
                 train_dataset.chunk_cache.clear()
                 train_dataset.current_file_idx = iteration
                 train_dataset.current_file = train_dataset.file_paths[iteration]
@@ -531,15 +545,10 @@ def train_multi_file(
             # Track validation info during first epoch
             if epoch == 0 and export_validation_ids:
                 val_info = _get_validation_info_for_current_file(
-                    train_dataset,
-                    val_dataset,
-                    iteration,
-                    config
+                    train_dataset, val_dataset, iteration, config
                 )
                 validation_info_list.append(val_info)
 
-            # Create dataloaders for current file
-            # Use multiprocessing for faster data loading
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=config['data']['batch_size'],
@@ -550,77 +559,161 @@ def train_multi_file(
                 persistent_workers=True if num_workers > 0 else False
             )
 
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=config['data']['batch_size'],
-                shuffle=False,
-                num_workers=num_workers,
-                prefetch_factor=prefetch_factor,
-                pin_memory=True if device.type == 'cuda' else False,
-                persistent_workers=True if num_workers > 0 else False
-            )
-
-            print(f"Training on file: {train_dataset.file_paths[train_dataset.current_file_idx]}")
-            print(f"Train dataset size: {len(train_dataset)} bonds")
-            print(f"Val dataset size: {len(val_dataset)} bonds")
-
-            # Train one iteration
-            start_time = time.time()
             train_metrics = train_epoch(
                 model, train_loader, optimizer, device, config,
-                epoch, iteration, total_files
+                epoch, iteration, total_files,
+                pbar=epoch_pbar
             )
-            train_time = time.time() - start_time
 
-            # Calculate global epoch (for logging and display)
-            global_iteration = epoch * total_files + iteration + 1  # +1 for 1-indexed
-            global_epoch = epoch + 1  # 1-indexed for display
+            global_iteration = epoch * total_files + iteration + 1
 
-            # Log training metrics
+            # Accumulate epoch-level training metrics (weighted by batch count)
+            n = train_metrics['num_batches']
+            epoch_train_total += train_metrics['total_loss'] * n
+            epoch_train_dist += train_metrics['distance_loss'] * n
+            epoch_train_geom += train_metrics['geometry_loss'] * n
+            epoch_total_batches += n
+
             history['train_loss'].append(train_metrics['total_loss'])
             history['train_distance_loss'].append(train_metrics['distance_loss'])
             history['train_geometry_loss'].append(train_metrics['geometry_loss'])
 
-            # Learning rate
             current_lr = optimizer.param_groups[0]['lr']
             history['learning_rates'].append(current_lr)
 
-            # Print training summary
-            print(f"\nEpoch {global_epoch} Training Summary:")
-            print(f"  Time: {train_time:.1f}s")
-            print(f"  Loss: {train_metrics['total_loss']:.6f}")
-            print(f"  Distance Loss: {train_metrics['distance_loss']:.6f}")
-            print(f"  Geometry Loss: {train_metrics['geometry_loss']:.6f}")
-            print(f"  Learning Rate: {current_lr:.6f}")
+            # Per-file checkpoint (val_loss not yet known)
+            save_every_n = config['checkpointing'].get('save_every_n_iterations', 1)
+            is_last_iteration = (epoch == num_epochs - 1) and (iteration == total_files - 1)
+            should_save = (global_iteration % save_every_n == 0) or is_last_iteration
 
-            # Initialize val_metrics to None (will be set if validation runs)
-            val_metrics = None
-
-            # Validation
-            if global_epoch % validate_every == 0:
-                print(f"\nRunning validation...")
-                val_start_time = time.time()
-                val_metrics = validate_on_file(
-                    model, val_loader, device, config,
-                    compute_detailed_metrics=(global_epoch % 5 == 0)  # Detailed metrics every 5 epochs
+            if checkpoint_callback is not None and should_save:
+                checkpoint_callback(
+                    epoch=epoch,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metrics={
+                        'iteration': iteration,
+                        'global_iteration': global_iteration,
+                        'train_loss': train_metrics['total_loss'],
+                        'val_loss': None,
+                        'best_val_loss': best_val_loss
+                    }
                 )
-                val_time = time.time() - val_start_time
+
+            if metrics_logger is not None:
+                metrics_logger.log(
+                    iteration=global_iteration,
+                    train_loss=train_metrics['total_loss'],
+                    val_loss=None,
+                    metrics={
+                        'train_distance_loss': train_metrics['distance_loss'],
+                        'train_geometry_loss': train_metrics['geometry_loss'],
+                        'val_distance_loss': None,
+                        'val_geometry_loss': None,
+                    },
+                    lr=current_lr,
+                    epoch=epoch + 1
+                )
+
+        epoch_pbar.close()
+
+        # Print epoch-level training summary
+        if epoch_total_batches > 0:
+            avg_train_total = epoch_train_total / epoch_total_batches
+            avg_train_dist = epoch_train_dist / epoch_total_batches
+            avg_train_geom = epoch_train_geom / epoch_total_batches
+        else:
+            avg_train_total = avg_train_dist = avg_train_geom = 0.0
+
+        print(f"\nEpoch {epoch + 1} Training Summary (all {total_files} files):")
+        print(f"  Loss: {avg_train_total:.6f}")
+        print(f"  Distance Loss: {avg_train_dist:.6f}")
+        print(f"  Geometry Loss: {avg_train_geom:.6f}")
+        print(f"  Learning Rate: {current_lr:.6f}")
+
+        # Save validation IDs after first epoch
+        if epoch == 0 and export_validation_ids and len(validation_info_list) > 0:
+            _save_validation_ids(validation_info_list, config)
+
+        # Validation once per epoch, after all training files
+        val_metrics = None
+        if (epoch + 1) % validate_every == 0 and current_fold != -1:
+            print(f"\nRunning validation on all {total_files} files...")
+            val_start_time = time.time()
+
+            # Reset val_dataset to file 0 then sweep all files
+            val_dataset.chunk_cache.clear()
+            val_dataset.current_file_idx = 0
+            val_dataset.current_file = val_dataset.file_paths[0]
+            val_dataset._load_file_metadata()
+
+            agg_val_loss = 0.0
+            agg_val_dist = 0.0
+            agg_val_geom = 0.0
+            agg_val_batches = 0
+            compute_detailed = ((epoch + 1) % 5 == 0)
+
+            for val_file_idx in range(total_files):
+                if val_file_idx > 0:
+                    val_dataset.next_file()
+
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=config['data']['batch_size'],
+                    shuffle=False,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
+                    pin_memory=True if device.type == 'cuda' else False,
+                    persistent_workers=True if num_workers > 0 else False
+                )
+
+                file_val = validate_on_file(
+                    model, val_loader, device, config,
+                    compute_detailed_metrics=compute_detailed
+                )
+
+                nv = file_val['num_batches']
+                agg_val_loss += file_val['total_loss'] * nv
+                agg_val_dist += file_val['distance_loss'] * nv
+                agg_val_geom += file_val['geometry_loss'] * nv
+                agg_val_batches += nv
+
+            val_time = time.time() - val_start_time
+
+            if agg_val_batches > 0:
+                val_metrics = {
+                    'total_loss': agg_val_loss / agg_val_batches,
+                    'distance_loss': agg_val_dist / agg_val_batches,
+                    'geometry_loss': agg_val_geom / agg_val_batches,
+                    'num_batches': agg_val_batches
+                }
 
                 history['val_loss'].append(val_metrics['total_loss'])
                 history['val_distance_loss'].append(val_metrics['distance_loss'])
                 history['val_geometry_loss'].append(val_metrics['geometry_loss'])
 
-                print(f"Validation Summary:")
+                print(f"\nValidation Summary (all {total_files} files):")
                 print(f"  Time: {val_time:.1f}s")
                 print(f"  Loss: {val_metrics['total_loss']:.6f}")
                 print(f"  Distance Loss: {val_metrics['distance_loss']:.6f}")
                 print(f"  Geometry Loss: {val_metrics['geometry_loss']:.6f}")
 
-                # Detailed metrics if computed
-                if 'distance_mae' in val_metrics:
-                    print(f"  Distance MAE: {val_metrics['distance_mae']:.4f} Å")
-                    print(f"  Distance RMSE: {val_metrics['distance_rmse']:.4f} Å")
-                    print(f"  Theta MAE: {val_metrics['theta_mae_deg']:.2f}°")
+                # Checkpoint with val_loss after epoch validation
+                if checkpoint_callback is not None:
+                    checkpoint_callback(
+                        epoch=epoch,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        metrics={
+                            'iteration': total_files - 1,
+                            'global_iteration': global_iteration,
+                            'train_loss': avg_train_total,
+                            'val_loss': val_metrics['total_loss'],
+                            'best_val_loss': best_val_loss
+                        }
+                    )
 
                 # Learning rate scheduling
                 if scheduler is not None:
@@ -629,7 +722,7 @@ def train_multi_file(
                     else:
                         scheduler.step()
 
-                # Early stopping check (only if early_stopping_patience is enabled)
+                # Early stopping
                 if early_stopping_patience is not None:
                     if val_metrics['total_loss'] < best_val_loss:
                         best_val_loss = val_metrics['total_loss']
@@ -641,54 +734,10 @@ def train_multi_file(
 
                     if patience_counter >= early_stopping_patience:
                         print(f"\n{'='*60}")
-                        print(f"Early stopping triggered at epoch {global_epoch}")
+                        print(f"Early stopping triggered at epoch {epoch + 1}")
                         print(f"Best validation loss: {best_val_loss:.6f}")
                         print(f"{'='*60}")
                         return history
-
-            # Checkpoint every N iterations (and always save the last iteration)
-            save_every_n = config['checkpointing'].get('save_every_n_iterations', 1)
-            is_last_iteration = (epoch == num_epochs - 1) and (iteration == total_files - 1)
-            should_save = (global_iteration % save_every_n == 0) or is_last_iteration
-
-            if checkpoint_callback is not None and should_save:
-                if is_last_iteration:
-                    print(f"\n[Checkpoint] Saving final iteration {iteration + 1}/{total_files}, epoch {epoch + 1}")
-                else:
-                    print(f"\n[Checkpoint] Saving at iteration {iteration + 1}/{total_files}, epoch {epoch + 1}")
-                checkpoint_callback(
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    metrics={
-                        'iteration': iteration,
-                        'global_iteration': global_iteration,
-                        'train_loss': train_metrics['total_loss'],
-                        'val_loss': val_metrics['total_loss'] if val_metrics is not None else None,
-                        'best_val_loss': best_val_loss
-                    }
-                )
-
-            # Log to metrics logger
-            if metrics_logger is not None:
-                metrics_logger.log(
-                    iteration=global_iteration,
-                    train_loss=train_metrics['total_loss'],
-                    val_loss=val_metrics['total_loss'] if val_metrics is not None else None,
-                    metrics={
-                        'train_distance_loss': train_metrics['distance_loss'],
-                        'train_geometry_loss': train_metrics['geometry_loss'],
-                        'val_distance_loss': val_metrics.get('distance_loss') if val_metrics is not None else None,
-                        'val_geometry_loss': val_metrics.get('geometry_loss') if val_metrics is not None else None,
-                    },
-                    lr=current_lr,
-                    epoch=global_epoch
-                )
-
-        # End of iteration loop - save validation IDs after first epoch
-        if epoch == 0 and export_validation_ids and len(validation_info_list) > 0:
-            _save_validation_ids(validation_info_list, config)
 
     print(f"\n{'='*60}")
     print("Training completed!")

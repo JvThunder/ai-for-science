@@ -27,7 +27,7 @@ setup(
     author="Your Name",
     author_email="your.email@example.com",
     url="https://github.com/yourusername/stereochem-gcn",
-    packages=find_packages(include=["utils", "utils.*", "lora", "lora.*"]),
+    packages=find_packages(include=["utils", "utils.*"]),
     python_requires=">=3.8",
     install_requires=[
         "torch>=2.0.0",
@@ -66,8 +66,6 @@ setup(
         "console_scripts": [
             "stereochem-train=local_geometry_gcn_stereo:main",
             "stereochem-reconstruct=reconstruction:main",
-            "lora-train=lora.local_geometry_gcn_stereo_lora:main",
-            "lora-utils=lora.lora_utils:main",
         ],
     },
     classifiers=[
