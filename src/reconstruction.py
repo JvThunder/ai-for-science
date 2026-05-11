@@ -415,61 +415,75 @@ def enforce_ring_closure(
     free_atoms = sorted(all_ring_atoms)
 
     # --- 2. Idealized ring initialization (chair for n=6, polygon otherwise) ---
+    # For fused ring systems (shared atoms between rings) the independent per-ring
+    # initialization produces contradictory positions for shared atoms and gives the
+    # optimizer a broken starting point.  In those cases use BFS positions directly —
+    # they are already geometrically reasonable and let L-BFGS-B refine from there.
+    atom_ring_membership: Dict[int, int] = {}
+    is_fused = False
+    for path in ring_paths:
+        for atom in path:
+            if atom in atom_ring_membership:
+                is_fused = True
+                break
+            atom_ring_membership[atom] = id(path)
+        if is_fused:
+            break
+
     init_pos = positions.copy()
 
-    for path in ring_paths:
-        n = len(path)
-        if n < 3:
-            continue
+    if not is_fused:
+        for path in ring_paths:
+            n = len(path)
+            if n < 3:
+                continue
 
-        ring_bond_lengths = []
-        for k in range(n):
-            a, b = path[k], path[(k + 1) % n]
-            d = predicted_distances.get((a, b), predicted_distances.get((b, a)))
-            if d is None:
-                d = float(np.linalg.norm(positions[b] - positions[a]))
-            ring_bond_lengths.append(d)
-        avg_bond = float(np.mean(ring_bond_lengths))
+            ring_bond_lengths = []
+            for k in range(n):
+                a, b = path[k], path[(k + 1) % n]
+                d = predicted_distances.get((a, b), predicted_distances.get((b, a)))
+                if d is None:
+                    d = float(np.linalg.norm(positions[b] - positions[a]))
+                ring_bond_lengths.append(d)
+            avg_bond = float(np.mean(ring_bond_lengths))
 
-        ring_center = np.mean(positions[path], axis=0)
+            ring_center = np.mean(positions[path], axis=0)
 
-        if n == 6:
-            # Determine avg ring-bond angle from model predictions or fall back to sp3.
-            # Derivation: for a chair hexagon, atoms alternate ±z0 around a ring of
-            # radius R.  The 1-2 bond length satisfies d² = R² + 4z0² and the
-            # bond angle satisfies cos(θ) = (−R²/2 − z0²) / d².  Solving:
-            #   z0 = d · sqrt(0.5 + cos(θ))
-            #   R  = d · sqrt(−1 − 4·cos(θ))
-            # (valid when −0.5 < cos(θ) < −0.25, i.e. 104.5° < θ < 120°)
-            thetas = []
-            if predicted_angles is not None:
-                for k in range(n):
-                    prev = path[(k - 1) % n]
-                    c    = path[k]
-                    nxt  = path[(k + 1) % n]
-                    t = (predicted_angles.get((prev, c, nxt)) or
-                         predicted_angles.get((nxt, c, prev)))
-                    if t is not None:
-                        thetas.append(t)
-            if thetas:
-                avg_theta = float(np.mean(thetas))
-                cos_t = math.cos(avg_theta)
-                z0 = avg_bond * math.sqrt(max(0.0, 0.5 + cos_t))
-                R  = avg_bond * math.sqrt(max(0.0, -1.0 - 4.0 * cos_t))
+            if n == 6:
+                # Derivation: for a chair hexagon, atoms alternate ±z0 around a ring of
+                # radius R.  The 1-2 bond length satisfies d² = R² + 4z0² and the
+                # bond angle satisfies cos(θ) = (−R²/2 − z0²) / d².  Solving:
+                #   z0 = d · sqrt(0.5 + cos(θ))
+                #   R  = d · sqrt(−1 − 4·cos(θ))
+                thetas = []
+                if predicted_angles is not None:
+                    for k in range(n):
+                        prev = path[(k - 1) % n]
+                        c    = path[k]
+                        nxt  = path[(k + 1) % n]
+                        t = (predicted_angles.get((prev, c, nxt)) or
+                             predicted_angles.get((nxt, c, prev)))
+                        if t is not None:
+                            thetas.append(t)
+                if thetas:
+                    avg_theta = float(np.mean(thetas))
+                    cos_t = math.cos(avg_theta)
+                    z0 = avg_bond * math.sqrt(max(0.0, 0.5 + cos_t))
+                    R  = avg_bond * math.sqrt(max(0.0, -1.0 - 4.0 * cos_t))
+                else:
+                    R  = avg_bond / (2.0 * math.sin(math.pi / n))
+                    z0 = 0.0
+                for k, atom in enumerate(path):
+                    angle = k * math.pi / 3.0
+                    z = z0 if k % 2 == 0 else -z0
+                    init_pos[atom] = ring_center + np.array([R * math.cos(angle),
+                                                              R * math.sin(angle), z])
             else:
-                R  = avg_bond / (2.0 * math.sin(math.pi / n))
-                z0 = 0.0
-            for k, atom in enumerate(path):
-                angle = k * math.pi / 3.0
-                z = z0 if k % 2 == 0 else -z0
-                init_pos[atom] = ring_center + np.array([R * math.cos(angle),
-                                                          R * math.sin(angle), z])
-        else:
-            R = avg_bond / (2.0 * math.sin(math.pi / n))
-            for k, atom in enumerate(path):
-                angle = 2.0 * math.pi * k / n
-                init_pos[atom] = ring_center + np.array([R * math.cos(angle),
-                                                          R * math.sin(angle), 0.0])
+                R = avg_bond / (2.0 * math.sin(math.pi / n))
+                for k, atom in enumerate(path):
+                    angle = 2.0 * math.pi * k / n
+                    init_pos[atom] = ring_center + np.array([R * math.cos(angle),
+                                                              R * math.sin(angle), 0.0])
 
     # --- 3. Build 1-2 and 1-3 constraint tables --------------------------------
     ring_bond_keys = {(min(i, j), max(i, j)) for i, j in ring_bonds}
