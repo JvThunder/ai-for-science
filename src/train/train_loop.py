@@ -39,7 +39,7 @@ def compute_batch_loss(
     Compute loss for a single batch.
 
     Args:
-        model: The LocalGeometryGCN model
+        model: The LocalGeometryGNN model
         data: PyG Data batch
         device: Device to run on
         config: Configuration dict with loss weights
@@ -72,7 +72,7 @@ def train_epoch(
     Train for one epoch (one file).
 
     Args:
-        model: The LocalGeometryGCN model
+        model: The LocalGeometryGNN model
         train_loader: DataLoader for current training file
         optimizer: Optimizer
         device: Device to run on
@@ -408,7 +408,7 @@ def train_multi_file(
     Automatically cycles through files and checkpoints after each epoch.
 
     Args:
-        model: The LocalGeometryGCN model
+        model: The LocalGeometryGNN model
         train_dataset: MultiFileStreamingDataset for training
         val_dataset: MultiFileStreamingDataset for validation (single file)
         optimizer: Optimizer

@@ -17,7 +17,7 @@ warnings.filterwarnings("ignore")
 # src/ is the parent of this file; add it so utils.* imports work regardless of cwd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from utils.model import LocalGeometryGCN
+from utils.model import LocalGeometryGNN
 from utils.dataset import (
     parse_xyz_string,
     parse_pubchem_data,
@@ -70,7 +70,7 @@ def load_trained_model(checkpoint_path, config_path, device="auto"):
     print(f"Checkpoint vocab size: {vocab_size}")
     print(f"Current element vocab size: {len(element_to_idx)}")
 
-    model = LocalGeometryGCN(
+    model = LocalGeometryGNN(
         num_node_features=vocab_size,
         hidden_dim=config["model"]["hidden_dim"],
         max_bonds=config["data"]["max_bonds"],

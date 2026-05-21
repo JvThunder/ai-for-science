@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Stereochemistry-Aware 3D Reconstruction GCN - Main Training Script
+Stereochemistry-Aware 3D Reconstruction GNN - Main Training Script
 
-This script implements a Graph Convolutional Network for predicting local
+This script implements a Graph Attention Network for predicting local
 molecular geometry in Spherical coordinates (r, θ, φ), enabling
 stereochemically-aware 3D structure reconstruction from learned representations.
 
@@ -45,7 +45,7 @@ except ImportError:
 
 # Import utilities
 from src.utils.config import load_config, validate_config, print_config
-from src.utils.model import LocalGeometryGCN, count_parameters, initialize_weights
+from src.utils.model import LocalGeometryGNN, count_parameters, initialize_weights
 from src.utils.dataset import MultiFileStreamingDataset, get_element_vocab
 from src.train.train_loop import train_multi_file
 from src.utils.checkpoint import save_checkpoint, load_checkpoint, find_latest_checkpoint
@@ -219,13 +219,13 @@ def create_model(config, device):
         device: torch.device
 
     Returns:
-        model: LocalGeometryGCN model
+        model: LocalGeometryGNN model
     """
     print("\n" + "="*60)
     print("Creating Model")
     print("="*60)
 
-    model = LocalGeometryGCN(
+    model = LocalGeometryGNN(
         num_node_features=config['model']['vocab_size'],
         hidden_dim=config['model']['hidden_dim'],
         max_bonds=config['data']['max_bonds'],
@@ -472,7 +472,7 @@ def init_wandb(config):
 
     # Initialize wandb
     wandb.init(
-        project=config['logging'].get('wandb_project', 'stereochem-gcn'),
+        project=config['logging'].get('wandb_project', 'stereochem-gnn'),
         entity=config['logging'].get('wandb_entity'),
         name=run_name,
         tags=config['logging'].get('wandb_tags', []),
@@ -516,7 +516,7 @@ def main():
     config = load_config(config_file)
 
     print("\n" + "="*60)
-    print("Stereochemistry-Aware 3D Reconstruction GCN")
+    print("Stereochemistry-Aware 3D Reconstruction GNN")
     print("="*60)
     print(f"Config file: {config_file}")
     print("="*60 + "\n")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-3D Molecular Geometry Reconstruction from Trained GCN Model
+3D Molecular Geometry Reconstruction from Trained GNN Model
 
-This script loads a trained LocalGeometryGCN model and reconstructs 3D molecular
+This script loads a trained LocalGeometryGNN model and reconstructs 3D molecular
 geometries from the predicted local spherical coordinates (r, theta, delta_phi).
 
 Usage:
@@ -26,7 +26,7 @@ import imageio
 import io
 
 # Import utilities from the project
-from src.utils.model import LocalGeometryGCN
+from src.utils.model import LocalGeometryGNN
 from src.utils.dataset import parse_xyz_string, parse_bonds_from_dataset, parse_pubchem_data, _pubchem_mapping_has_error, get_element_vocab, dfs_subgraph
 from src.utils.geometry import compute_local_geometry, spherical_to_cartesian, create_orthonormal_frame, get_neighbor_sort_keys
 from src.utils.config import load_config
@@ -37,9 +37,9 @@ def load_trained_model(
     checkpoint_path: str,
     config_path: str = "config.yaml",
     device: str = "auto"
-) -> Tuple[LocalGeometryGCN, Dict[str, int], torch.device]:
+) -> Tuple[LocalGeometryGNN, Dict[str, int], torch.device]:
     """
-    Load a trained LocalGeometryGCN model from checkpoint.
+    Load a trained LocalGeometryGNN model from checkpoint.
 
     Args:
         checkpoint_path: Path to model checkpoint (.pt file)
@@ -67,7 +67,7 @@ def load_trained_model(
     vocab_size = len(element_to_idx)
 
     # Create model with same architecture
-    model = LocalGeometryGCN(
+    model = LocalGeometryGNN(
         num_node_features=vocab_size,
         hidden_dim=config['model']['hidden_dim'],
         max_bonds=config['data']['max_bonds'],
@@ -264,7 +264,7 @@ def create_graph_data(
 
 
 def predict_bond_geometry(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     data: 'torch_geometric.data.Data',
     device: torch.device
 ) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -322,7 +322,7 @@ def find_center_atom(adjacency: Dict[int, List[int]], n_atoms: int) -> int:
 
 
 def predict_bond_distance_multiple(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
@@ -367,7 +367,7 @@ def predict_bond_distance_multiple(
 
 
 def distance_geometry_reconstruction(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
@@ -686,7 +686,7 @@ def global_optimization_refinement(
 
 
 def reconstruct_from_center(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     elements: List[str],
     bonds_data: List[Dict],
     element_to_idx: Dict[str, int],
@@ -852,7 +852,7 @@ def reconstruct_from_center(
 
 
 def reconstruct_with_bfs_tracking(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     coordinates: List[List[float]],
     elements: List[str],
     bonds_data: List[Dict],
@@ -1440,7 +1440,7 @@ def create_bfs_animation_gif(
 
 
 def reconstruct_molecule(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     elements: List[str],
     bonds_data: List[Dict],
     element_to_idx: Dict[str, int],
@@ -1644,7 +1644,7 @@ def compute_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
 
 
 def compute_reconstruction_loss(
-    model: LocalGeometryGCN,
+    model: LocalGeometryGNN,
     original_coords: np.ndarray,
     reconstructed_coords: np.ndarray,
     elements: List[str],

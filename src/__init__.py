@@ -1,1 +1,1 @@
-"""Stereochemistry-Aware 3D Reconstruction GCN package."""
+"""Stereochemistry-Aware 3D Reconstruction GNN package."""

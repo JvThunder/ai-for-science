@@ -13,7 +13,7 @@ Usage:
 import torch
 import torch.nn as nn
 from src.utils.config import load_config
-from src.utils.model import LocalGeometryGCN
+from src.utils.model import LocalGeometryGNN
 import argparse
 
 
@@ -122,7 +122,7 @@ def main():
     print("Creating Model")
     print("="*70)
 
-    model = LocalGeometryGCN(
+    model = LocalGeometryGNN(
         num_node_features=config['model'].get('vocab_size', 70),
         hidden_dim=config['model']['hidden_dim'],
         max_bonds=config['data']['max_bonds'],
