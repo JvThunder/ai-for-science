@@ -120,7 +120,7 @@ loss:
 
   # Individual angular geometry component weights (all normalized and equal)
   theta_weight: 1.0     # Polar angle (degrees) [0, 180°]
-  phi_weight: 2.0       # Relative azimuthal difference (degrees) [0, 360°]
+  phi_weight: 1.0       # Relative azimuthal difference (degrees) [0, 360°]
   
 # Checkpointing
 checkpointing:

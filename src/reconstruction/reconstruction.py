@@ -1446,9 +1446,8 @@ def reconstruct_molecule(
     element_to_idx: Dict[str, int],
     device: torch.device,
     max_bonds: int = 7,
-    n_refinement_iterations: int = 3,
     use_global_optimization: bool = True,
-    n_multi_start: int = 2,
+    n_multi_start: int = 2  ,
     use_distance_geometry: bool = False
 ) -> np.ndarray:
     """
@@ -1468,7 +1467,6 @@ def reconstruct_molecule(
         element_to_idx: Element vocabulary
         device: torch device
         max_bonds: Maximum bonds per atom
-        n_refinement_iterations: Number of refinement iterations (legacy)
         use_global_optimization: If True, use scipy.optimize for refinement
         n_multi_start: Number of different starting atoms to try
         use_distance_geometry: Distance geometry not supported without coordinates
