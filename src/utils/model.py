@@ -1,7 +1,7 @@
 """
 Model architecture for stereochemistry-aware 3D reconstruction.
 
-This module implements the LocalGeometryGCN model that predicts:
+This module implements the LocalGeometryGNN model that predicts:
 - Bond distances (A-B distance)
 - Local spherical angular geometry (θ, Δφ) for neighbors of both atoms
   where Δφ are relative azimuthal angle differences (first neighbor at Δφ=0)
@@ -31,9 +31,9 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
 
-class LocalGeometryGCN(nn.Module):
+class LocalGeometryGNN(nn.Module):
     """
-    Graph Convolutional Network for predicting local molecular geometry.
+    Graph Attention Network for predicting local molecular geometry.
 
     Predicts:
     - Distance between target atoms A and B
