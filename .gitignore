@@ -94,7 +94,6 @@ wandb/
 
 # Custom configs (keep templates)
 config_custom.yaml
-lora/lora_config_custom.yaml
 
 reconstruction_results/
 polymer_results/

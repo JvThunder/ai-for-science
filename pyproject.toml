@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stereochem-gcn"
 version = "1.0.0"
-description = "Stereochemistry-Aware 3D Molecular Reconstruction using Graph Convolutional Networks with LoRA Fine-tuning"
+description = "Stereochemistry-Aware 3D Molecular Reconstruction using Graph Convolutional Networks"
 readme = "README.md"
 requires-python = ">=3.8.1"
 license = "MIT"
@@ -20,8 +20,6 @@ keywords = [
     "graph-neural-networks",
     "stereochemistry",
     "3d-reconstruction",
-    "lora",
-    "fine-tuning",
     "chemistry",
     "machine-learning",
 ]
@@ -66,7 +64,6 @@ Issues = "https://github.com/yourusername/stereochem-gcn/issues"
 # Command-line entry points
 stereochem-train = "src.train.train_model:main"
 stereochem-reconstruct = "src.reconstruction.reconstruction:main"
-lora-train = "src.lora.train_lora:main"
 
 # ============================================================================
 # Tool Configurations
